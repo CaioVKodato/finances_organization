@@ -1,0 +1,22 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Backend (Maven / H2)
+backend/target/
+backend/data/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Maven empacotado localmente (opcional; não versionar binários)
+tools/maven/
+
+# Logs
+*.log
