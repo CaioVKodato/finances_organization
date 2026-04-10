@@ -4,6 +4,7 @@ import {
   ChevronLeft,
   ChevronRight,
   LayoutDashboard,
+  LogOut,
   Plus,
   Pencil,
   Trash2,
@@ -14,31 +15,46 @@ import {
   Receipt,
   PiggyBank,
   TrendingDown,
+  Upload,
 } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
 import {
   createCard,
+  createDependent,
   createExpense,
   deleteCard,
+  deleteDependent,
   deleteExpense,
   fetchCards,
   fetchDashboard,
   fetchExpenses,
   fetchSettings,
+  commitStatementImport,
+  logout,
+  previewStatementImport,
   updateCard,
   updateExpense,
   updateSettings,
 } from './api'
+import { getToken } from './authStorage'
 import { brl, coerceMoney, formatDate } from './format'
 import { Modal } from './components/Modal'
-import type { Card, Expense, SpentBy } from './types'
-import { SPENT_BY_BADGE, SPENT_BY_LABEL } from './types'
+import type { Card, Expense, StatementPreviewResponse } from './types'
+import { badgeClassForExpense, labelForSpentKey } from './types'
 
 const PRESET_COLORS = ['#6366f1', '#ec4899', '#14b8a6', '#f59e0b', '#8b5cf6', '#ef4444', '#22c55e', '#3b82f6']
 
-const SPENT_OPTIONS: SpentBy[] = ['SELF', 'GIRLFRIEND', 'MOTHER', 'OTHER']
-
 function formatPeriod(isoStart: string, isoEnd: string): string {
   return `${formatDate(isoStart)} — ${formatDate(isoEnd)}`
+}
+
+function formatDateTime(iso: string | null | undefined): string {
+  if (iso == null || iso === '') return '—'
+  try {
+    return new Date(iso).toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' })
+  } catch {
+    return '—'
+  }
 }
 
 function previewInstallmentParts(total: number, n: number): string {
@@ -49,6 +65,7 @@ function previewInstallmentParts(total: number, n: number): string {
 }
 
 export default function App() {
+  const navigate = useNavigate()
   const [cards, setCards] = useState<Card[]>([])
   const [expenses, setExpenses] = useState<Expense[]>([])
   const [summary, setSummary] = useState<Awaited<ReturnType<typeof fetchDashboard>> | null>(null)
@@ -58,7 +75,7 @@ export default function App() {
 
   type GastosModalState = { mode: 'card'; card: Card } | { mode: 'all' }
   const [gastosModal, setGastosModal] = useState<GastosModalState | null>(null)
-  const [gastosPersonFilter, setGastosPersonFilter] = useState<SpentBy | 'ALL'>('ALL')
+  const [gastosPersonFilter, setGastosPersonFilter] = useState<string>('ALL')
 
   const [cardModal, setCardModal] = useState(false)
   const [editingCard, setEditingCard] = useState<Card | null>(null)
@@ -68,6 +85,7 @@ export default function App() {
     colorHex: PRESET_COLORS[0]!,
     invoiceClosingDay: '' as string,
   })
+  const [newDependentName, setNewDependentName] = useState('')
 
   const [settingsModal, setSettingsModal] = useState(false)
   const [incomeInput, setIncomeInput] = useState('')
@@ -76,6 +94,14 @@ export default function App() {
   const cardSlideRefs = useRef<(HTMLDivElement | null)[]>([])
   const [carouselIndex, setCarouselIndex] = useState(0)
 
+  const [statementImportCard, setStatementImportCard] = useState<Card | null>(null)
+  const [statementPreview, setStatementPreview] = useState<StatementPreviewResponse | null>(null)
+  const [statementLineChoices, setStatementLineChoices] = useState<
+    Record<string, { spentBySelf: boolean; dependentPersonId: number | null }>
+  >({})
+  const [statementImportBusy, setStatementImportBusy] = useState(false)
+  const statementFileInputRef = useRef<HTMLInputElement>(null)
+
   const [expenseModal, setExpenseModal] = useState(false)
   const [editingExpense, setEditingExpense] = useState<Expense | null>(null)
   const [expenseForm, setExpenseForm] = useState({
@@ -83,12 +109,17 @@ export default function App() {
     amount: '',
     description: '',
     expenseDate: new Date().toISOString().slice(0, 10),
-    spentBy: 'SELF' as SpentBy,
+    spentBySelf: true,
+    dependentPersonId: null as number | null,
     notes: '',
     installmentCount: 1,
   })
 
   const refresh = useCallback(async () => {
+    if (!getToken()) {
+      navigate('/login', { replace: true })
+      return
+    }
     setError(null)
     setLoading(true)
     try {
@@ -108,7 +139,7 @@ export default function App() {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [navigate])
 
   useEffect(() => {
     void refresh()
@@ -158,7 +189,12 @@ export default function App() {
       list = list.filter((x) => x.cardId === gastosModal.card.id)
     }
     if (gastosPersonFilter !== 'ALL') {
-      list = list.filter((x) => x.spentBy === gastosPersonFilter)
+      if (gastosPersonFilter === 'SELF') {
+        list = list.filter((x) => x.spentBySelf)
+      } else if (gastosPersonFilter.startsWith('dep:')) {
+        const id = Number(gastosPersonFilter.slice(4))
+        list = list.filter((x) => !x.spentBySelf && x.dependentPersonId === id)
+      }
     }
     return list
   }, [expenses, gastosModal, gastosPersonFilter])
@@ -190,6 +226,79 @@ export default function App() {
     setGastosModal(null)
   }
 
+  function openStatementImport(card: Card) {
+    setStatementImportCard(card)
+    setStatementPreview(null)
+    setStatementLineChoices({})
+    setStatementImportBusy(false)
+    if (statementFileInputRef.current) statementFileInputRef.current.value = ''
+  }
+
+  function closeStatementImport() {
+    setStatementImportCard(null)
+    setStatementPreview(null)
+    setStatementLineChoices({})
+    setStatementImportBusy(false)
+    if (statementFileInputRef.current) statementFileInputRef.current.value = ''
+  }
+
+  async function handleStatementFile(file: File | undefined) {
+    if (!file || !statementImportCard) return
+    setStatementImportBusy(true)
+    setError(null)
+    try {
+      const prev = await previewStatementImport(statementImportCard.id, file)
+      setStatementPreview(prev)
+      const init: Record<string, { spentBySelf: boolean; dependentPersonId: number | null }> = {}
+      for (const line of prev.lines) {
+        init[line.lineHash] = { spentBySelf: true, dependentPersonId: null }
+      }
+      setStatementLineChoices(init)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Erro ao ler a fatura')
+    } finally {
+      setStatementImportBusy(false)
+    }
+  }
+
+  const statementCommitReady = useMemo(() => {
+    if (!statementPreview || statementPreview.lines.length === 0) return false
+    return statementPreview.lines.every((line) => {
+      const ch = statementLineChoices[line.lineHash]
+      if (!ch) return false
+      if (ch.spentBySelf) return true
+      return ch.dependentPersonId != null
+    })
+  }, [statementPreview, statementLineChoices])
+
+  async function submitStatementImport() {
+    if (!statementImportCard || !statementPreview || !statementCommitReady) return
+    setStatementImportBusy(true)
+    setError(null)
+    try {
+      await commitStatementImport(
+        statementImportCard.id,
+        statementPreview.lines.map((line) => {
+          const ch = statementLineChoices[line.lineHash]!
+          return {
+            lineHash: line.lineHash,
+            expenseDate: line.expenseDate,
+            amount: line.amount,
+            description: line.description,
+            spentBySelf: ch.spentBySelf,
+            dependentPersonId: ch.spentBySelf ? null : ch.dependentPersonId,
+          }
+        }),
+      )
+      await refresh()
+      closeStatementImport()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Erro ao salvar os gastos')
+    } finally {
+      setStatementImportBusy(false)
+    }
+  }
+
   function openSettings() {
     setIncomeInput(String(monthlyIncome))
     setSettingsModal(true)
@@ -215,11 +324,13 @@ export default function App() {
 
   function openNewCard() {
     setEditingCard(null)
+    setNewDependentName('')
     setCardForm({ name: '', lastFour: '', colorHex: PRESET_COLORS[0]!, invoiceClosingDay: '' })
     setCardModal(true)
   }
 
   function openEditCard(c: Card) {
+    setNewDependentName('')
     setEditingCard(c)
     setCardForm({
       name: c.name,
@@ -260,6 +371,30 @@ export default function App() {
     }
   }
 
+  async function addDependentToCard() {
+    if (!editingCard || !newDependentName.trim()) return
+    setError(null)
+    try {
+      await createDependent(editingCard.id, newDependentName.trim())
+      setNewDependentName('')
+      await refresh()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Erro ao adicionar pessoa')
+    }
+  }
+
+  async function removeDependentPerson(depId: number) {
+    if (!editingCard) return
+    if (!confirm('Remover esta pessoa do cartão?')) return
+    setError(null)
+    try {
+      await deleteDependent(editingCard.id, depId)
+      await refresh()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Erro ao remover')
+    }
+  }
+
   async function removeCard(c: Card) {
     if (!confirm(`Excluir o cartão "${c.name}" e todos os gastos vinculados?`)) return
     setError(null)
@@ -280,7 +415,8 @@ export default function App() {
       amount: '',
       description: '',
       expenseDate: new Date().toISOString().slice(0, 10),
-      spentBy: 'SELF',
+      spentBySelf: true,
+      dependentPersonId: null,
       notes: '',
       installmentCount: 1,
     })
@@ -294,7 +430,8 @@ export default function App() {
       amount: String(ex.amount),
       description: ex.description,
       expenseDate: ex.expenseDate,
-      spentBy: ex.spentBy,
+      spentBySelf: ex.spentBySelf,
+      dependentPersonId: ex.dependentPersonId,
       notes: ex.notes ?? '',
       installmentCount: ex.installmentCount ?? 1,
     })
@@ -315,6 +452,10 @@ export default function App() {
       setError('Valor por parcela muito baixo')
       return
     }
+    if (!expenseForm.spentBySelf && (expenseForm.dependentPersonId == null || expenseForm.dependentPersonId <= 0)) {
+      setError('Selecione quem gastou ou marque como Eu')
+      return
+    }
     try {
       if (editingExpense) {
         await updateExpense(editingExpense.id, {
@@ -322,7 +463,8 @@ export default function App() {
           amount,
           description: expenseForm.description.trim(),
           expenseDate: expenseForm.expenseDate,
-          spentBy: expenseForm.spentBy,
+          spentBySelf: expenseForm.spentBySelf,
+          dependentPersonId: expenseForm.spentBySelf ? null : expenseForm.dependentPersonId,
           notes: notes === '' ? null : notes,
         })
       } else {
@@ -331,7 +473,8 @@ export default function App() {
           amount,
           description: expenseForm.description.trim(),
           expenseDate: expenseForm.expenseDate,
-          spentBy: expenseForm.spentBy,
+          spentBySelf: expenseForm.spentBySelf,
+          dependentPersonId: expenseForm.spentBySelf ? null : expenseForm.dependentPersonId,
           notes: notes === '' ? null : notes,
           installmentCount: inst,
         })
@@ -378,56 +521,82 @@ export default function App() {
       : ''
 
   return (
-    <div className="mx-auto min-h-dvh max-w-6xl px-4 pb-16 pt-8 sm:px-6">
-      <header className="mb-10 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
-        <div>
-          <div className="mb-2 inline-flex items-center gap-2 rounded-full bg-violet-500/15 px-3 py-1 text-xs font-medium text-violet-300 ring-1 ring-violet-500/25">
-            <Wallet className="h-3.5 w-3.5" />
-            Controle por cartão e por pessoa
+    <div className="relative mx-auto min-h-dvh max-w-6xl px-4 pb-16 pt-8 sm:px-6">
+      {/* Canto superior direito da tela — só ícones */}
+      <div
+        className="fixed right-3 top-3 z-50 flex items-center gap-1 sm:right-5 sm:top-4"
+        role="toolbar"
+        aria-label="Conta e sincronização"
+      >
+        <button
+          type="button"
+          onClick={() => void refresh()}
+          disabled={loading}
+          title="Atualizar dados"
+          aria-label="Atualizar dados"
+          className="rounded-xl border border-white/10 bg-zinc-900/90 p-2.5 text-zinc-200 shadow-lg backdrop-blur-md transition hover:bg-white/10 hover:text-white disabled:opacity-50"
+        >
+          <RefreshCw className={`h-5 w-5 ${loading ? 'animate-spin' : ''}`} />
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            logout()
+            navigate('/login', { replace: true })
+          }}
+          title="Sair"
+          aria-label="Sair da conta"
+          className="rounded-xl border border-white/10 bg-zinc-900/90 p-2.5 text-zinc-400 shadow-lg backdrop-blur-md transition hover:border-red-500/30 hover:bg-red-950/40 hover:text-red-200"
+        >
+          <LogOut className="h-5 w-5" />
+        </button>
+      </div>
+
+      <header className="mb-10 pr-2 sm:pr-0">
+        <div className="flex flex-col gap-6 sm:flex-row sm:items-start sm:justify-between">
+          <div className="min-w-0 max-w-xl pr-16 sm:pr-0">
+            <div className="mb-2 inline-flex items-center gap-2 rounded-full bg-violet-500/15 px-3 py-1 text-xs font-medium text-violet-300 ring-1 ring-violet-500/25">
+              <Wallet className="h-3.5 w-3.5 shrink-0" />
+              Controle por cartão e por pessoa
+            </div>
+            <h1 className="bg-gradient-to-br from-white to-zinc-400 bg-clip-text text-3xl font-bold tracking-tight text-transparent sm:text-4xl">
+              Suas finanças
+            </h1>
+            <p className="mt-2 text-sm text-zinc-400">
+              Registre compras à vista ou parceladas, acompanhe a fatura de cada cartão e o quanto ainda pode gastar no
+              mês.
+            </p>
           </div>
-          <h1 className="bg-gradient-to-br from-white to-zinc-400 bg-clip-text text-3xl font-bold tracking-tight text-transparent sm:text-4xl">
-            Suas finanças
-          </h1>
-          <p className="mt-2 max-w-xl text-sm text-zinc-400">
-            Registre compras à vista ou parceladas, acompanhe a fatura de cada cartão e o quanto ainda pode gastar no
-            mês.
-          </p>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <button
-            type="button"
-            onClick={() => void refresh()}
-            disabled={loading}
-            className="inline-flex items-center gap-2 rounded-xl border border-white/10 bg-white/5 px-4 py-2.5 text-sm font-medium text-zinc-200 transition hover:bg-white/10 disabled:opacity-50"
-          >
-            <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
-            Atualizar
-          </button>
-          <button
-            type="button"
-            onClick={openSettings}
-            className="inline-flex items-center gap-2 rounded-xl border border-emerald-500/35 bg-emerald-600/20 px-4 py-2.5 text-sm font-medium text-emerald-200 transition hover:bg-emerald-600/35"
-          >
-            <PiggyBank className="h-4 w-4" />
-            Renda mensal
-          </button>
-          <button
-            type="button"
-            onClick={openNewCard}
-            className="inline-flex items-center gap-2 rounded-xl border border-violet-500/40 bg-violet-600/30 px-4 py-2.5 text-sm font-medium text-violet-100 transition hover:bg-violet-600/45"
-          >
-            <CreditCard className="h-4 w-4" />
-            Cartão
-          </button>
-          <button
-            type="button"
-            onClick={openNewExpense}
-            disabled={cards.length === 0}
-            className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-violet-600 to-fuchsia-600 px-4 py-2.5 text-sm font-semibold text-white shadow-lg shadow-violet-900/40 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            <Plus className="h-4 w-4" />
-            Gasto
-          </button>
+          <div className="flex shrink-0 flex-wrap items-center justify-start gap-1.5 sm:justify-end">
+            <button
+              type="button"
+              onClick={openSettings}
+              title="Renda mensal"
+              aria-label="Renda mensal"
+              className="rounded-xl border border-emerald-500/25 bg-emerald-600/15 p-2.5 text-emerald-200/90 transition hover:border-emerald-500/40 hover:bg-emerald-600/25"
+            >
+              <PiggyBank className="h-5 w-5" />
+            </button>
+            <button
+              type="button"
+              onClick={openNewCard}
+              title="Novo cartão"
+              aria-label="Novo cartão"
+              className="rounded-xl border border-violet-500/35 bg-violet-600/20 p-2.5 text-violet-100 transition hover:border-violet-400/50 hover:bg-violet-600/35"
+            >
+              <CreditCard className="h-5 w-5" />
+            </button>
+            <button
+              type="button"
+              onClick={openNewExpense}
+              disabled={cards.length === 0}
+              title="Novo gasto"
+              aria-label="Novo gasto"
+              className="rounded-xl bg-gradient-to-r from-violet-600 to-fuchsia-600 p-2.5 text-white shadow-lg shadow-violet-900/35 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <Plus className="h-5 w-5" />
+            </button>
+          </div>
         </div>
       </header>
 
@@ -503,17 +672,24 @@ export default function App() {
               {summary ? brl(summary.totalAll) : '—'}
             </p>
           </div>
-          {SPENT_OPTIONS.map((sb) => (
-            <div
-              key={sb}
-              className="rounded-2xl border border-white/10 bg-white/[0.04] p-5 backdrop-blur-sm"
-            >
-              <p className="text-xs font-medium text-zinc-500">{SPENT_BY_LABEL[sb]}</p>
-              <p className="mt-1 font-mono text-xl font-semibold tabular-nums text-white">
-                {summary ? brl(summary.bySpentBy[sb] ?? 0) : '—'}
-              </p>
-            </div>
-          ))}
+          {summary &&
+            Object.keys(summary.bySpentBy)
+              .sort((a, b) => {
+                if (a === 'SELF') return -1
+                if (b === 'SELF') return 1
+                return a.localeCompare(b)
+              })
+              .map((key) => (
+                <div
+                  key={key}
+                  className="rounded-2xl border border-white/10 bg-white/[0.04] p-5 backdrop-blur-sm"
+                >
+                  <p className="text-xs font-medium text-zinc-500">{labelForSpentKey(key, cards)}</p>
+                  <p className="mt-1 font-mono text-xl font-semibold tabular-nums text-white">
+                    {brl(summary.bySpentBy[key] ?? 0)}
+                  </p>
+                </div>
+              ))}
         </div>
       </section>
 
@@ -614,6 +790,18 @@ export default function App() {
                             type="button"
                             onClick={(e) => {
                               e.stopPropagation()
+                              openStatementImport(c)
+                            }}
+                            className="rounded-lg p-2 text-zinc-400 hover:bg-white/10 hover:text-violet-300"
+                            aria-label="Importar fatura (CSV)"
+                            title="Importar fatura (CSV)"
+                          >
+                            <Upload className="h-4 w-4" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation()
                               openEditCard(c)
                             }}
                             className="rounded-lg p-2 text-zinc-400 hover:bg-white/10 hover:text-white"
@@ -649,6 +837,9 @@ export default function App() {
                           </p>
                         )}
                         <p className="text-xs text-zinc-600">Total histórico: {brl(total)}</p>
+                        <p className="text-[11px] text-zinc-600">
+                          Última importação CSV: {formatDateTime(c.lastStatementImportAt ?? null)}
+                        </p>
                       </div>
                     </div>
                     </div>
@@ -727,15 +918,18 @@ export default function App() {
             <select
               id="gastos-person-filter"
               value={gastosPersonFilter}
-              onChange={(e) => setGastosPersonFilter(e.target.value as SpentBy | 'ALL')}
+              onChange={(e) => setGastosPersonFilter(e.target.value)}
               className="rounded-lg border border-white/10 bg-zinc-900/80 px-3 py-1.5 text-sm text-zinc-200 outline-none focus:ring-2 focus:ring-violet-500/50"
             >
               <option value="ALL">Todas</option>
-              {SPENT_OPTIONS.map((sb) => (
-                <option key={sb} value={sb}>
-                  {SPENT_BY_LABEL[sb]}
-                </option>
-              ))}
+              <option value="SELF">Eu</option>
+              {cards.flatMap((c) =>
+                c.dependents.map((d) => (
+                  <option key={d.id} value={`dep:${d.id}`}>
+                    {d.name} ({c.name})
+                  </option>
+                )),
+              )}
             </select>
           </div>
 
@@ -790,9 +984,9 @@ export default function App() {
                       )}
                       <td className="px-3 py-2.5">
                         <span
-                          className={`inline-flex rounded-full px-2 py-0.5 text-xs font-medium ring-1 ${SPENT_BY_BADGE[ex.spentBy]}`}
+                          className={`inline-flex rounded-full px-2 py-0.5 text-xs font-medium ring-1 ${badgeClassForExpense(ex)}`}
                         >
-                          {SPENT_BY_LABEL[ex.spentBy]}
+                          {ex.spentBySelf ? 'Eu' : ex.dependentPersonName ?? '—'}
                         </span>
                       </td>
                       <td className="px-3 py-2.5 text-right font-mono font-semibold tabular-nums text-white">
@@ -835,6 +1029,137 @@ export default function App() {
             </div>
           )}
         </div>
+      </Modal>
+
+      <Modal
+        open={statementImportCard != null}
+        onClose={() => {
+          if (!statementImportBusy) closeStatementImport()
+        }}
+        title={statementImportCard ? `Importar fatura — ${statementImportCard.name}` : 'Importar fatura'}
+        panelClassName="max-w-3xl"
+      >
+        {statementImportCard && (
+          <div className="space-y-4">
+            <p className="text-sm text-zinc-400">
+              Envie um CSV da fatura (exportação do banco ou planilha com colunas de <strong className="text-zinc-300">data</strong>,{' '}
+              <strong className="text-zinc-300">descrição</strong> e <strong className="text-zinc-300">valor</strong>). Linhas já
+              importadas neste cartão são ignoradas automaticamente.
+            </p>
+            <p className="text-xs text-zinc-500">
+              Última importação concluída:{' '}
+              <span className="font-mono text-zinc-400">
+                {formatDateTime(statementImportCard.lastStatementImportAt ?? null)}
+              </span>
+            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                ref={statementFileInputRef}
+                type="file"
+                accept=".csv,text/csv"
+                className="hidden"
+                onChange={(e) => void handleStatementFile(e.target.files?.[0])}
+              />
+              <button
+                type="button"
+                disabled={statementImportBusy}
+                onClick={() => statementFileInputRef.current?.click()}
+                className="rounded-xl border border-white/15 bg-white/5 px-4 py-2 text-sm text-zinc-200 transition hover:bg-white/10 disabled:opacity-50"
+              >
+                Escolher arquivo CSV
+              </button>
+              {statementImportBusy && !statementPreview && (
+                <span className="text-xs text-zinc-500">Lendo arquivo…</span>
+              )}
+            </div>
+            {statementPreview && (
+              <>
+                {statementPreview.skippedAlreadyImported > 0 && (
+                  <p className="text-xs text-amber-400/90">
+                    {statementPreview.skippedAlreadyImported} linha(s) já estavam registradas e foram ignoradas.
+                  </p>
+                )}
+                {statementPreview.lines.length === 0 ? (
+                  <p className="rounded-xl border border-dashed border-white/15 py-8 text-center text-sm text-zinc-500">
+                    Nenhuma linha nova para importar. Todas já constam no sistema ou o arquivo não tinha lançamentos válidos.
+                  </p>
+                ) : (
+                  <>
+                    <div className="max-h-[min(50vh,400px)] overflow-auto rounded-xl border border-white/10">
+                      <table className="w-full text-left text-sm">
+                        <thead className="sticky top-0 z-[1] bg-[oklch(0.19_0.025_280)]">
+                          <tr className="border-b border-white/10 text-xs uppercase tracking-wider text-zinc-500">
+                            <th className="px-3 py-2.5 font-medium">Data</th>
+                            <th className="px-3 py-2.5 font-medium">Descrição</th>
+                            <th className="px-3 py-2.5 text-right font-medium">Valor</th>
+                            <th className="px-3 py-2.5 font-medium">Quem gastou</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {statementPreview.lines.map((line) => {
+                            const ch = statementLineChoices[line.lineHash] ?? {
+                              spentBySelf: true,
+                              dependentPersonId: null,
+                            }
+                            const deps = statementImportCard.dependents
+                            return (
+                              <tr key={line.lineHash} className="border-b border-white/5">
+                                <td className="whitespace-nowrap px-3 py-2.5 font-mono text-zinc-400">
+                                  {formatDate(line.expenseDate)}
+                                </td>
+                                <td className="max-w-[200px] px-3 py-2.5 text-zinc-200 sm:max-w-xs">{line.description}</td>
+                                <td className="px-3 py-2.5 text-right font-mono font-semibold tabular-nums text-white">
+                                  {brl(line.amount)}
+                                </td>
+                                <td className="px-3 py-2.5">
+                                  <select
+                                    value={
+                                      ch.spentBySelf
+                                        ? 'self'
+                                        : ch.dependentPersonId != null
+                                          ? String(ch.dependentPersonId)
+                                          : 'self'
+                                    }
+                                    onChange={(e) => {
+                                      const v = e.target.value
+                                      setStatementLineChoices((prev) => ({
+                                        ...prev,
+                                        [line.lineHash]:
+                                          v === 'self'
+                                            ? { spentBySelf: true, dependentPersonId: null }
+                                            : { spentBySelf: false, dependentPersonId: Number.parseInt(v, 10) },
+                                      }))
+                                    }}
+                                    className="w-full min-w-[140px] rounded-lg border border-white/10 bg-zinc-900/80 px-2 py-1.5 text-xs text-white outline-none focus:ring-2 focus:ring-violet-500/50"
+                                  >
+                                    <option value="self">Eu (titular)</option>
+                                    {deps.map((d) => (
+                                      <option key={d.id} value={d.id}>
+                                        {d.name}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </td>
+                              </tr>
+                            )
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={!statementCommitReady || statementImportBusy}
+                      onClick={() => void submitStatementImport()}
+                      className="w-full rounded-xl bg-gradient-to-r from-violet-600 to-fuchsia-600 py-3 text-sm font-semibold text-white shadow-lg shadow-violet-900/30 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      {statementImportBusy ? 'Salvando…' : 'Registrar gastos'}
+                    </button>
+                  </>
+                )}
+              </>
+            )}
+          </div>
+        )}
       </Modal>
 
       <Modal open={settingsModal} onClose={() => setSettingsModal(false)} title="Renda mensal">
@@ -928,6 +1253,45 @@ export default function App() {
               className="mt-2 w-full rounded-xl border border-white/10 bg-zinc-900/80 px-3 py-2 font-mono text-sm text-white outline-none focus:ring-2 focus:ring-violet-500/50"
             />
           </div>
+          {editingCard && (
+            <div className="rounded-xl border border-white/10 bg-zinc-900/50 p-4">
+              <p className="mb-2 text-xs font-medium text-zinc-400">
+                Pessoas que podem gastar neste cartão (além de você)
+              </p>
+              <div className="flex flex-col gap-2 sm:flex-row">
+                <input
+                  value={newDependentName}
+                  onChange={(e) => setNewDependentName(e.target.value)}
+                  placeholder="Ex: Mãe, filho…"
+                  className="min-w-0 flex-1 rounded-xl border border-white/10 bg-zinc-900/80 px-3 py-2 text-sm text-white outline-none focus:ring-2 focus:ring-violet-500/50"
+                />
+                <button
+                  type="button"
+                  onClick={() => void addDependentToCard()}
+                  className="shrink-0 rounded-xl border border-violet-500/40 bg-violet-600/25 px-4 py-2 text-sm font-medium text-violet-100 hover:bg-violet-600/40"
+                >
+                  Adicionar
+                </button>
+              </div>
+              <ul className="mt-3 space-y-2">
+                {(cards.find((cc) => cc.id === editingCard.id)?.dependents ?? []).map((d) => (
+                  <li
+                    key={d.id}
+                    className="flex items-center justify-between gap-2 rounded-lg border border-white/5 bg-white/[0.03] px-3 py-2 text-sm"
+                  >
+                    <span className="text-zinc-200">{d.name}</span>
+                    <button
+                      type="button"
+                      onClick={() => void removeDependentPerson(d.id)}
+                      className="text-xs text-red-400 hover:text-red-300"
+                    >
+                      Remover
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
           <button
             type="submit"
             className="w-full rounded-xl bg-gradient-to-r from-violet-600 to-fuchsia-600 py-3 text-sm font-semibold text-white shadow-lg shadow-violet-900/30"
@@ -1021,18 +1385,39 @@ export default function App() {
           <div>
             <label className="mb-1.5 block text-xs font-medium text-zinc-400">Quem gastou</label>
             <select
-              value={expenseForm.spentBy}
-              onChange={(e) =>
-                setExpenseForm((f) => ({ ...f, spentBy: e.target.value as SpentBy }))
+              value={
+                expenseForm.spentBySelf
+                  ? 'self'
+                  : expenseForm.dependentPersonId != null
+                    ? String(expenseForm.dependentPersonId)
+                    : 'self'
               }
+              onChange={(e) => {
+                const v = e.target.value
+                if (v === 'self') {
+                  setExpenseForm((f) => ({ ...f, spentBySelf: true, dependentPersonId: null }))
+                } else {
+                  setExpenseForm((f) => ({
+                    ...f,
+                    spentBySelf: false,
+                    dependentPersonId: Number.parseInt(v, 10),
+                  }))
+                }
+              }}
               className="w-full rounded-xl border border-white/10 bg-zinc-900/80 px-3 py-2.5 text-sm text-white outline-none focus:ring-2 focus:ring-violet-500/50"
             >
-              {SPENT_OPTIONS.map((sb) => (
-                <option key={sb} value={sb}>
-                  {SPENT_BY_LABEL[sb]}
+              <option value="self">Eu (titular)</option>
+              {(cards.find((c) => c.id === expenseForm.cardId)?.dependents ?? []).map((d) => (
+                <option key={d.id} value={d.id}>
+                  {d.name}
                 </option>
               ))}
             </select>
+            {(cards.find((c) => c.id === expenseForm.cardId)?.dependents ?? []).length === 0 && (
+              <p className="mt-1 text-xs text-amber-400/90">
+                Cadastre pessoas no cartão (editar cartão) para atribuir gasto a alguém além de você.
+              </p>
+            )}
           </div>
           <div>
             <label className="mb-1.5 block text-xs font-medium text-zinc-400">Descrição</label>
