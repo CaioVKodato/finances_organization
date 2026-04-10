@@ -10,6 +10,8 @@ Thumbs.db
 # Backend (Maven / H2)
 backend/target/
 backend/data/
+# Banco H2 na raiz do projeto (caminho alternativo em application.properties)
+data/
 
 # Frontend
 frontend/node_modules/
