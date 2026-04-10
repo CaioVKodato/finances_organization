@@ -2,6 +2,7 @@ package com.finance.organization.web;
 
 import com.finance.organization.dto.ExpenseRequest;
 import com.finance.organization.dto.ExpenseResponse;
+import com.finance.organization.service.CurrentUserService;
 import com.finance.organization.service.ExpenseService;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
@@ -23,25 +24,30 @@ import java.util.List;
 public class ExpenseController {
 
     private final ExpenseService expenseService;
+    private final CurrentUserService currentUserService;
 
-    public ExpenseController(ExpenseService expenseService) {
+    public ExpenseController(ExpenseService expenseService, CurrentUserService currentUserService) {
         this.expenseService = expenseService;
+        this.currentUserService = currentUserService;
     }
 
     @GetMapping
     public List<ExpenseResponse> list(@RequestParam(required = false) Long cardId) {
-        return expenseService.findAll(cardId);
+        long uid = currentUserService.requireUserId();
+        return expenseService.findAll(uid, cardId);
     }
 
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)
     public List<ExpenseResponse> create(@Valid @RequestBody ExpenseRequest request) {
-        return expenseService.create(request);
+        long uid = currentUserService.requireUserId();
+        return expenseService.create(uid, request);
     }
 
     @PutMapping("/{id}")
     public ExpenseResponse update(@PathVariable Long id, @Valid @RequestBody ExpenseRequest request) {
-        return expenseService.update(id, request);
+        long uid = currentUserService.requireUserId();
+        return expenseService.update(uid, id, request);
     }
 
     @DeleteMapping("/{id}")
@@ -50,6 +56,7 @@ public class ExpenseController {
             @PathVariable Long id,
             @RequestParam(defaultValue = "false") boolean deleteGroup
     ) {
-        expenseService.delete(id, deleteGroup);
+        long uid = currentUserService.requireUserId();
+        expenseService.delete(uid, id, deleteGroup);
     }
 }

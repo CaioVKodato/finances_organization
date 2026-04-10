@@ -1,7 +1,5 @@
 package com.finance.organization.dto;
 
-import com.finance.organization.model.SpentBy;
-
 import java.math.BigDecimal;
 import java.time.LocalDate;
 
@@ -13,7 +11,9 @@ public record ExpenseResponse(
         BigDecimal amount,
         String description,
         LocalDate expenseDate,
-        SpentBy spentBy,
+        boolean spentBySelf,
+        Long dependentPersonId,
+        String dependentPersonName,
         String notes,
         String installmentGroupId,
         Integer installmentIndex,

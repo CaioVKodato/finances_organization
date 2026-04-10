@@ -2,8 +2,6 @@ package com.finance.organization.model;
 
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
-import jakarta.persistence.EnumType;
-import jakarta.persistence.Enumerated;
 import jakarta.persistence.FetchType;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
@@ -36,9 +34,13 @@ public class Expense {
     @Column(nullable = false)
     private LocalDate expenseDate;
 
-    @Enumerated(EnumType.STRING)
-    @Column(nullable = false, length = 32)
-    private SpentBy spentBy;
+    /** {@code true} = titular (Eu); {@code false} = dependente cadastrado no cartão. */
+    @Column(name = "spent_by_self", nullable = false)
+    private boolean spentBySelf = true;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "dependent_person_id")
+    private CardDependent dependentPerson;
 
     private String notes;
 
@@ -51,6 +53,10 @@ public class Expense {
 
     @Column(precision = 14, scale = 2)
     private BigDecimal totalPurchaseAmount;
+
+    /** Hash estável da linha da fatura (deduplicação entre importações). */
+    @Column(length = 64)
+    private String statementLineHash;
 
     public Long getId() {
         return id;
@@ -92,12 +98,20 @@ public class Expense {
         this.expenseDate = expenseDate;
     }
 
-    public SpentBy getSpentBy() {
-        return spentBy;
+    public boolean isSpentBySelf() {
+        return spentBySelf;
     }
 
-    public void setSpentBy(SpentBy spentBy) {
-        this.spentBy = spentBy;
+    public void setSpentBySelf(boolean spentBySelf) {
+        this.spentBySelf = spentBySelf;
+    }
+
+    public CardDependent getDependentPerson() {
+        return dependentPerson;
+    }
+
+    public void setDependentPerson(CardDependent dependentPerson) {
+        this.dependentPerson = dependentPerson;
     }
 
     public String getNotes() {
@@ -138,5 +152,13 @@ public class Expense {
 
     public void setTotalPurchaseAmount(BigDecimal totalPurchaseAmount) {
         this.totalPurchaseAmount = totalPurchaseAmount;
+    }
+
+    public String getStatementLineHash() {
+        return statementLineHash;
+    }
+
+    public void setStatementLineHash(String statementLineHash) {
+        this.statementLineHash = statementLineHash;
     }
 }
