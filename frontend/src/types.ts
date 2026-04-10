@@ -1,12 +1,32 @@
-export type SpentBy = 'SELF' | 'GIRLFRIEND' | 'MOTHER' | 'OTHER'
+export interface CardDependent {
+  id: number
+  cardId: number
+  name: string
+  sortOrder: number | null
+}
 
 export interface Card {
   id: number
   name: string
   lastFourDigits: string | null
   colorHex: string
-  /** 1–28: dia de fechamento; sem valor = fatura pelo mês civil */
   invoiceClosingDay: number | null
+  /** ISO-8601 instant; última importação de fatura (CSV) concluída */
+  lastStatementImportAt?: string | null
+  dependents: CardDependent[]
+}
+
+export interface StatementPreviewLine {
+  lineHash: string
+  expenseDate: string
+  amount: number
+  description: string
+}
+
+export interface StatementPreviewResponse {
+  lastStatementImportAt: string | null
+  skippedAlreadyImported: number
+  lines: StatementPreviewLine[]
 }
 
 export interface Expense {
@@ -17,7 +37,9 @@ export interface Expense {
   amount: number
   description: string
   expenseDate: string
-  spentBy: SpentBy
+  spentBySelf: boolean
+  dependentPersonId: number | null
+  dependentPersonName: string | null
   notes: string | null
   installmentGroupId: string | null
   installmentIndex: number | null
@@ -30,9 +52,7 @@ export interface DashboardSummary {
   byCard: { cardId: number; cardName: string; colorHex: string; total: number }[]
   bySpentBy: Record<string, number>
   monthlyIncome: number
-  /** Só gastos marcados como Eu — usados no "ainda pode gastar" */
   spentSelfInCurrentCalendarMonth: number
-  /** Todos os gastos no mês (referência) */
   spentAllInCurrentCalendarMonth: number
   remainingBudget: number
   cardInvoices: {
@@ -49,16 +69,38 @@ export interface Settings {
   monthlyIncome: number
 }
 
-export const SPENT_BY_LABEL: Record<SpentBy, string> = {
-  SELF: 'Eu',
-  GIRLFRIEND: 'Namorada',
-  MOTHER: 'Mãe',
-  OTHER: 'Outro',
+/** Chaves em bySpentBy: "SELF" ou "dep:&lt;id&gt;" */
+export function labelForSpentKey(key: string, cards: Card[]): string {
+  if (key === 'SELF') return 'Eu'
+  if (key.startsWith('dep:')) {
+    const id = Number(key.slice(4))
+    if (Number.isNaN(id)) return key
+    for (const c of cards) {
+      const d = c.dependents.find((x) => x.id === id)
+      if (d) return d.name
+    }
+    return `Pessoa #${id}`
+  }
+  return key
 }
 
-export const SPENT_BY_BADGE: Record<SpentBy, string> = {
-  SELF: 'bg-emerald-500/20 text-emerald-300 ring-emerald-500/30',
-  GIRLFRIEND: 'bg-rose-500/20 text-rose-300 ring-rose-500/30',
-  MOTHER: 'bg-amber-500/20 text-amber-200 ring-amber-500/30',
-  OTHER: 'bg-slate-500/25 text-slate-300 ring-slate-500/35',
+const BADGE_ROT = [
+  'bg-rose-500/20 text-rose-300 ring-rose-500/30',
+  'bg-amber-500/20 text-amber-200 ring-amber-500/30',
+  'bg-sky-500/20 text-sky-200 ring-sky-500/30',
+  'bg-emerald-500/20 text-emerald-300 ring-emerald-500/30',
+  'bg-orange-500/20 text-orange-200 ring-orange-500/30',
+]
+
+export function badgeClassForSpentKey(key: string): string {
+  if (key === 'SELF') return 'bg-emerald-500/20 text-emerald-300 ring-emerald-500/30'
+  const h = key.split('').reduce((a, c) => a + c.charCodeAt(0), 0)
+  return BADGE_ROT[h % BADGE_ROT.length]!
+}
+
+export function badgeClassForExpense(ex: Expense): string {
+  if (ex.spentBySelf) return 'bg-emerald-500/20 text-emerald-300 ring-emerald-500/30'
+  const name = ex.dependentPersonName ?? ''
+  const h = name.split('').reduce((a, c) => a + c.charCodeAt(0), 0)
+  return BADGE_ROT[h % BADGE_ROT.length]!
 }

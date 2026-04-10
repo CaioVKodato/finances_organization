@@ -1,9 +1,19 @@
+import { clearToken, getToken, setToken } from './authStorage'
 import { coerceMoney } from './format'
-import type { Card, DashboardSummary, Expense, Settings, SpentBy } from './types'
+import type {
+  Card,
+  DashboardSummary,
+  Expense,
+  Settings,
+  StatementPreviewResponse,
+} from './types'
 
 const base = import.meta.env.VITE_API_URL?.replace(/\/$/, '') ?? ''
 
 async function handle<T>(res: Response): Promise<T> {
+  if (res.status === 401) {
+    clearToken()
+  }
   if (!res.ok) {
     let msg = res.statusText
     try {
@@ -18,12 +28,52 @@ async function handle<T>(res: Response): Promise<T> {
   return res.json() as Promise<T>
 }
 
+function authHeaders(): HeadersInit {
+  const t = getToken()
+  const h: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (t) h.Authorization = `Bearer ${t}`
+  return h
+}
+
+function authHeadersMultipart(): HeadersInit {
+  const t = getToken()
+  const h: Record<string, string> = {}
+  if (t) h.Authorization = `Bearer ${t}`
+  return h
+}
+
 function url(path: string) {
   return `${base}${path}`
 }
 
+export async function register(email: string, password: string): Promise<{ token: string; email: string }> {
+  const res = await fetch(url('/api/auth/register'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  })
+  const data = await handle<{ token: string; email: string }>(res)
+  setToken(data.token)
+  return data
+}
+
+export async function login(email: string, password: string): Promise<{ token: string; email: string }> {
+  const res = await fetch(url('/api/auth/login'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  })
+  const data = await handle<{ token: string; email: string }>(res)
+  setToken(data.token)
+  return data
+}
+
+export function logout(): void {
+  clearToken()
+}
+
 export async function fetchCards(): Promise<Card[]> {
-  return handle(await fetch(url('/api/cards')))
+  return handle(await fetch(url('/api/cards'), { headers: authHeaders() }))
 }
 
 export async function createCard(body: {
@@ -35,7 +85,7 @@ export async function createCard(body: {
   return handle(
     await fetch(url('/api/cards'), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders(),
       body: JSON.stringify(body),
     }),
   )
@@ -53,19 +103,76 @@ export async function updateCard(
   return handle(
     await fetch(url(`/api/cards/${id}`), {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders(),
       body: JSON.stringify(body),
     }),
   )
 }
 
 export async function deleteCard(id: number): Promise<void> {
-  await handle(await fetch(url(`/api/cards/${id}`), { method: 'DELETE' }))
+  await handle(await fetch(url(`/api/cards/${id}`), { method: 'DELETE', headers: authHeaders() }))
+}
+
+export async function previewStatementImport(cardId: number, file: File): Promise<StatementPreviewResponse> {
+  const fd = new FormData()
+  fd.append('file', file)
+  const res = await fetch(url(`/api/cards/${cardId}/statement/preview`), {
+    method: 'POST',
+    headers: authHeadersMultipart(),
+    body: fd,
+  })
+  const data = await handle<StatementPreviewResponse>(res)
+  return {
+    ...data,
+    lines: (data.lines ?? []).map((l) => ({
+      ...l,
+      amount: coerceMoney(l.amount),
+    })),
+  }
+}
+
+export async function commitStatementImport(
+  cardId: number,
+  lines: Array<{
+    lineHash: string
+    expenseDate: string
+    amount: number
+    description: string
+    spentBySelf: boolean
+    dependentPersonId: number | null
+  }>,
+): Promise<{ imported: number; skippedDuplicates: number }> {
+  return handle(
+    await fetch(url(`/api/cards/${cardId}/statement/commit`), {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ lines }),
+    }),
+  )
+}
+
+export async function createDependent(cardId: number, name: string): Promise<import('./types').CardDependent> {
+  return handle(
+    await fetch(url(`/api/cards/${cardId}/dependents`), {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ name }),
+    }),
+  )
+}
+
+export async function deleteDependent(cardId: number, dependentId: number): Promise<void> {
+  await handle(
+    await fetch(url(`/api/cards/${cardId}/dependents/${dependentId}`), {
+      method: 'DELETE',
+      headers: authHeaders(),
+    }),
+  )
 }
 
 export async function fetchExpenses(cardId?: number | null): Promise<Expense[]> {
   const q = cardId != null ? `?cardId=${cardId}` : ''
-  return handle(await fetch(url(`/api/expenses${q}`)))
+  return handle(await fetch(url(`/api/expenses${q}`), { headers: authHeaders() }))
 }
 
 export async function createExpense(body: {
@@ -73,14 +180,15 @@ export async function createExpense(body: {
   amount: number
   description: string
   expenseDate: string
-  spentBy: SpentBy
+  spentBySelf: boolean
+  dependentPersonId: number | null
   notes: string | null
   installmentCount: number
 }): Promise<Expense[]> {
   return handle(
     await fetch(url('/api/expenses'), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders(),
       body: JSON.stringify(body),
     }),
   )
@@ -93,14 +201,15 @@ export async function updateExpense(
     amount: number
     description: string
     expenseDate: string
-    spentBy: SpentBy
+    spentBySelf: boolean
+    dependentPersonId: number | null
     notes: string | null
   },
 ): Promise<Expense> {
   return handle(
     await fetch(url(`/api/expenses/${id}`), {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders(),
       body: JSON.stringify(body),
     }),
   )
@@ -108,7 +217,7 @@ export async function updateExpense(
 
 export async function deleteExpense(id: number, deleteGroup = false): Promise<void> {
   const q = deleteGroup ? '?deleteGroup=true' : ''
-  await handle(await fetch(url(`/api/expenses/${id}${q}`), { method: 'DELETE' }))
+  await handle(await fetch(url(`/api/expenses/${id}${q}`), { method: 'DELETE', headers: authHeaders() }))
 }
 
 function normalizeDashboardSummary(raw: DashboardSummary): DashboardSummary {
@@ -120,9 +229,7 @@ function normalizeDashboardSummary(raw: DashboardSummary): DashboardSummary {
     spentSelfInCurrentCalendarMonth: coerceMoney(raw.spentSelfInCurrentCalendarMonth),
     spentAllInCurrentCalendarMonth: coerceMoney(raw.spentAllInCurrentCalendarMonth),
     remainingBudget: coerceMoney(raw.remainingBudget),
-    bySpentBy: Object.fromEntries(
-      Object.entries(bySpent).map(([k, v]) => [k, coerceMoney(v)]),
-    ),
+    bySpentBy: Object.fromEntries(Object.entries(bySpent).map(([k, v]) => [k, coerceMoney(v)])),
     byCard: (raw.byCard ?? []).map((c) => ({
       ...c,
       total: coerceMoney(c.total),
@@ -135,19 +242,19 @@ function normalizeDashboardSummary(raw: DashboardSummary): DashboardSummary {
 }
 
 export async function fetchDashboard(): Promise<DashboardSummary> {
-  const raw = await handle<DashboardSummary>(await fetch(url('/api/dashboard/summary')))
+  const raw = await handle<DashboardSummary>(await fetch(url('/api/dashboard/summary'), { headers: authHeaders() }))
   return normalizeDashboardSummary(raw)
 }
 
 export async function fetchSettings(): Promise<Settings> {
-  return handle(await fetch(url('/api/settings')))
+  return handle(await fetch(url('/api/settings'), { headers: authHeaders() }))
 }
 
 export async function updateSettings(monthlyIncome: number): Promise<Settings> {
   return handle(
     await fetch(url('/api/settings'), {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders(),
       body: JSON.stringify({ monthlyIncome }),
     }),
   )
