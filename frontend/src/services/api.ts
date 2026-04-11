@@ -1,12 +1,13 @@
 import { clearToken, getToken, setToken } from './authStorage'
-import { coerceMoney } from './format'
+import { coerceMoney } from '../utils/format'
 import type {
   Card,
+  CardDependent,
   DashboardSummary,
   Expense,
   Settings,
   StatementPreviewResponse,
-} from './types'
+} from '../types'
 
 const base = import.meta.env.VITE_API_URL?.replace(/\/$/, '') ?? ''
 
@@ -151,7 +152,7 @@ export async function commitStatementImport(
   )
 }
 
-export async function createDependent(cardId: number, name: string): Promise<import('./types').CardDependent> {
+export async function createDependent(cardId: number, name: string): Promise<CardDependent> {
   return handle(
     await fetch(url(`/api/cards/${cardId}/dependents`), {
       method: 'POST',

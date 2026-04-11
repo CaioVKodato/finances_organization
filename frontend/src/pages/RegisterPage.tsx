@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { register } from '../api'
+import { register } from '../services/api'
 import { Wallet } from 'lucide-react'
 
 export default function RegisterPage() {
@@ -20,7 +20,7 @@ export default function RegisterPage() {
     setLoading(true)
     try {
       await register(email.trim(), password)
-      navigate('/', { replace: true })
+      navigate('/app', { replace: true })
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Falha ao cadastrar')
     } finally {
@@ -78,6 +78,11 @@ export default function RegisterPage() {
           Já tem conta?{' '}
           <Link to="/login" className="font-medium text-violet-400 hover:text-violet-300">
             Entrar
+          </Link>
+        </p>
+        <p className="mt-4 text-center">
+          <Link to="/" className="text-sm text-zinc-500 transition hover:text-zinc-300">
+            ← Voltar à página inicial
           </Link>
         </p>
       </div>
