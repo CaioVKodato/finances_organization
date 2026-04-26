@@ -19,6 +19,8 @@ public interface ExpenseRepository extends JpaRepository<Expense, Long> {
 
     void deleteByInstallmentGroupId(String installmentGroupId);
 
+    void deleteBySplitGroupId(String splitGroupId);
+
     @Query("SELECT e FROM Expense e JOIN FETCH e.card c JOIN FETCH c.user WHERE c.user.id = :userId ORDER BY e.expenseDate DESC, e.id DESC")
     List<Expense> findAllWithCardForUser(@Param("userId") Long userId);
 

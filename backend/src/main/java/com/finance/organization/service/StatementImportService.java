@@ -5,6 +5,7 @@ import com.finance.organization.dto.StatementCommitResponse;
 import com.finance.organization.dto.StatementCommitRow;
 import com.finance.organization.dto.StatementPreviewLine;
 import com.finance.organization.dto.StatementPreviewResponse;
+import com.finance.organization.dto.StatementSplitPart;
 import com.finance.organization.model.Card;
 import com.finance.organization.model.CardDependent;
 import com.finance.organization.model.Expense;
@@ -20,6 +21,7 @@ import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 
 @Service
 public class StatementImportService {
@@ -76,6 +78,8 @@ public class StatementImportService {
 
         int imported = 0;
         int skippedDuplicates = 0;
+        BigDecimal totalImportedAmount = BigDecimal.ZERO;
+        int importedStatementLines = 0;
         for (StatementCommitRow row : request.lines()) {
             String expected = StatementLineHasher.hash(
                     cardId,
@@ -91,25 +95,66 @@ public class StatementImportService {
                 continue;
             }
 
-            Expense e = new Expense();
-            e.setCard(card);
-            BigDecimal amt = row.amount() == null ? BigDecimal.ZERO : row.amount().abs();
-            e.setAmount(amt);
-            e.setDescription(row.description().trim());
-            e.setExpenseDate(row.expenseDate());
-            e.setStatementLineHash(row.lineHash());
-            applySpender(e, card, row.spentBySelf(), row.dependentPersonId());
-            e.setNotes(null);
-            e.setInstallmentCount(1);
-            e.setInstallmentIndex(1);
-            e.setTotalPurchaseAmount(amt);
-            expenseRepository.save(e);
-            imported++;
+            BigDecimal lineAbs = row.amount() == null ? BigDecimal.ZERO : row.amount().abs();
+            List<StatementSplitPart> parts = row.splits();
+            if (parts != null && parts.size() >= 2) {
+                validateSplitPartsTotal(lineAbs, parts);
+                String splitGroupId = UUID.randomUUID().toString();
+                int m = parts.size();
+                for (int i = 0; i < m; i++) {
+                    StatementSplitPart p = parts.get(i);
+                    Expense e = new Expense();
+                    e.setCard(card);
+                    e.setAmount(p.amount());
+                    e.setDescription(row.description().trim());
+                    e.setExpenseDate(row.expenseDate());
+                    e.setStatementLineHash(i == 0 ? row.lineHash() : null);
+                    applySpender(e, card, p.spentBySelf(), p.dependentPersonId());
+                    e.setNotes("Divisão " + (i + 1) + "/" + m);
+                    e.setInstallmentCount(1);
+                    e.setInstallmentIndex(1);
+                    e.setTotalPurchaseAmount(lineAbs);
+                    e.setSplitGroupId(splitGroupId);
+                    e.setSplitPartIndex(i + 1);
+                    e.setSplitPartCount(m);
+                    expenseRepository.save(e);
+                    imported++;
+                }
+            } else {
+                if (row.spentBySelf() == null) {
+                    throw new BadRequestException("Informe quem gastou em cada linha");
+                }
+                Expense e = new Expense();
+                e.setCard(card);
+                e.setAmount(lineAbs);
+                e.setDescription(row.description().trim());
+                e.setExpenseDate(row.expenseDate());
+                e.setStatementLineHash(row.lineHash());
+                applySpender(e, card, row.spentBySelf(), row.dependentPersonId());
+                e.setNotes(null);
+                e.setInstallmentCount(1);
+                e.setInstallmentIndex(1);
+                e.setTotalPurchaseAmount(lineAbs);
+                expenseRepository.save(e);
+                imported++;
+            }
+            totalImportedAmount = totalImportedAmount.add(lineAbs);
+            importedStatementLines++;
         }
 
         card.setLastStatementImportAt(Instant.now());
         cardRepository.save(card);
-        return new StatementCommitResponse(imported, skippedDuplicates);
+        return new StatementCommitResponse(imported, skippedDuplicates, totalImportedAmount, importedStatementLines);
+    }
+
+    private static void validateSplitPartsTotal(BigDecimal lineAbs, List<StatementSplitPart> parts) {
+        BigDecimal sum = BigDecimal.ZERO;
+        for (StatementSplitPart p : parts) {
+            sum = sum.add(p.amount());
+        }
+        if (sum.subtract(lineAbs).abs().compareTo(new BigDecimal("0.02")) > 0) {
+            throw new BadRequestException("Nas linhas divididas, a soma das partes deve igualar o valor da linha");
+        }
     }
 
     private void applySpender(Expense e, Card card, boolean spentBySelf, Long dependentPersonId) {

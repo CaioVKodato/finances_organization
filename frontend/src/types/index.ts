@@ -45,6 +45,9 @@ export interface Expense {
   installmentIndex: number | null
   installmentCount: number | null
   totalPurchaseAmount: number | null
+  splitGroupId: string | null
+  splitPartIndex: number | null
+  splitPartCount: number | null
 }
 
 export interface DashboardSummary {

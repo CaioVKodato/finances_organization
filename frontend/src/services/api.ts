@@ -139,17 +139,36 @@ export async function commitStatementImport(
     expenseDate: string
     amount: number
     description: string
-    spentBySelf: boolean
-    dependentPersonId: number | null
+    spentBySelf?: boolean
+    dependentPersonId?: number | null
+    splits?: Array<{
+      spentBySelf: boolean
+      dependentPersonId: number | null
+      amount: number
+    }>
   }>,
-): Promise<{ imported: number; skippedDuplicates: number }> {
-  return handle(
+): Promise<{
+  imported: number
+  skippedDuplicates: number
+  totalImportedAmount: number
+  importedStatementLines: number
+}> {
+  const raw = await handle<{
+    imported: number
+    skippedDuplicates: number
+    totalImportedAmount: number
+    importedStatementLines: number
+  }>(
     await fetch(url(`/api/cards/${cardId}/statement/commit`), {
       method: 'POST',
       headers: authHeaders(),
       body: JSON.stringify({ lines }),
     }),
   )
+  return {
+    ...raw,
+    totalImportedAmount: coerceMoney(raw.totalImportedAmount),
+  }
 }
 
 export async function createDependent(cardId: number, name: string): Promise<CardDependent> {
@@ -185,6 +204,7 @@ export async function createExpense(body: {
   dependentPersonId: number | null
   notes: string | null
   installmentCount: number
+  splits?: Array<{ spentBySelf: boolean; dependentPersonId: number | null; amount: number }>
 }): Promise<Expense[]> {
   return handle(
     await fetch(url('/api/expenses'), {
@@ -205,6 +225,8 @@ export async function updateExpense(
     spentBySelf: boolean
     dependentPersonId: number | null
     notes: string | null
+    installmentCount?: number
+    splits?: Array<{ spentBySelf: boolean; dependentPersonId: number | null; amount: number }>
   },
 ): Promise<Expense> {
   return handle(

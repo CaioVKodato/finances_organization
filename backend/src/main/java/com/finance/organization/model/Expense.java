@@ -58,6 +58,13 @@ public class Expense {
     @Column(length = 64)
     private String statementLineHash;
 
+    @Column(length = 36)
+    private String splitGroupId;
+
+    private Integer splitPartIndex;
+
+    private Integer splitPartCount;
+
     public Long getId() {
         return id;
     }
@@ -160,5 +167,29 @@ public class Expense {
 
     public void setStatementLineHash(String statementLineHash) {
         this.statementLineHash = statementLineHash;
+    }
+
+    public String getSplitGroupId() {
+        return splitGroupId;
+    }
+
+    public void setSplitGroupId(String splitGroupId) {
+        this.splitGroupId = splitGroupId;
+    }
+
+    public Integer getSplitPartIndex() {
+        return splitPartIndex;
+    }
+
+    public void setSplitPartIndex(Integer splitPartIndex) {
+        this.splitPartIndex = splitPartIndex;
+    }
+
+    public Integer getSplitPartCount() {
+        return splitPartCount;
+    }
+
+    public void setSplitPartCount(Integer splitPartCount) {
+        this.splitPartCount = splitPartCount;
     }
 }

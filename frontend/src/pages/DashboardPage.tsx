@@ -64,6 +64,60 @@ function previewInstallmentParts(total: number, n: number): string {
   return n > 1 ? `${brl(per)} × ${n - 1} + ${brl(last)}` : ''
 }
 
+/** Centavos distribuídos em n partes (soma exata). */
+function equalPartsAmountStrings(total: number, n: number): string[] {
+  if (n < 1 || Number.isNaN(total)) return []
+  const cents = Math.round(total * 100)
+  const base = Math.floor(cents / n)
+  const rem = cents - base * n
+  const out: string[] = []
+  for (let i = 0; i < n; i++) {
+    const c = base + (i < rem ? 1 : 0)
+    out.push((c / 100).toFixed(2))
+  }
+  return out
+}
+
+/** Valor do <select> alinhado às options em string (evita React/HTML não aplicar a opção correta). */
+function dependentSelectValue(spentBySelf: boolean, dependentPersonId: number | null): string {
+  return spentBySelf ? 'self' : String(dependentPersonId ?? '')
+}
+
+/** Ao trocar o cartão, mantém partes válidas e corrige IDs de dependentes que não existem no novo cartão. */
+function fixSplitPartsForNewCard(
+  parts: Array<{ spentBySelf: boolean; dependentPersonId: number | null; amount: string }>,
+  cardId: number,
+  cardList: Card[],
+): Array<{ spentBySelf: boolean; dependentPersonId: number | null; amount: string }> {
+  const deps = cardList.find((c) => c.id === cardId)?.dependents ?? []
+  const depIds = new Set(deps.map((d) => d.id))
+  return parts.map((p) => {
+    if (p.spentBySelf) {
+      return { ...p, dependentPersonId: null }
+    }
+    if (p.dependentPersonId != null && depIds.has(p.dependentPersonId)) {
+      return p
+    }
+    const d0 = deps[0]
+    if (d0) {
+      return { spentBySelf: false, dependentPersonId: d0.id, amount: p.amount }
+    }
+    return { spentBySelf: true, dependentPersonId: null, amount: p.amount }
+  })
+}
+
+function stripSplitNotesSuffix(notes: string | null | undefined): string {
+  if (notes == null || notes === '') return ''
+  return notes.replace(/\s*— Divisão \d+\/\d+$/, '').trim()
+}
+
+type StatementLineChoice =
+  | { mode: 'single'; spentBySelf: boolean; dependentPersonId: number | null }
+  | {
+      mode: 'split'
+      parts: Array<{ spentBySelf: boolean; dependentPersonId: number | null; amount: string }>
+    }
+
 export default function DashboardPage() {
   const navigate = useNavigate()
   const [cards, setCards] = useState<Card[]>([])
@@ -96,10 +150,17 @@ export default function DashboardPage() {
 
   const [statementImportCard, setStatementImportCard] = useState<Card | null>(null)
   const [statementPreview, setStatementPreview] = useState<StatementPreviewResponse | null>(null)
-  const [statementLineChoices, setStatementLineChoices] = useState<
-    Record<string, { spentBySelf: boolean; dependentPersonId: number | null }>
-  >({})
+  const [statementLineChoices, setStatementLineChoices] = useState<Record<string, StatementLineChoice>>({})
+  /** Hashes das linhas do preview que o usuário não quer registrar (ex.: ajustes da fatura). */
+  const [statementExcludedLineHashes, setStatementExcludedLineHashes] = useState<string[]>([])
   const [statementImportBusy, setStatementImportBusy] = useState(false)
+  const [statementImportResult, setStatementImportResult] = useState<{
+    imported: number
+    skippedDuplicates: number
+    totalImportedAmount: number
+    importedStatementLines: number
+  } | null>(null)
+  const [statementQuickDependentName, setStatementQuickDependentName] = useState('')
   const statementFileInputRef = useRef<HTMLInputElement>(null)
 
   const [expenseModal, setExpenseModal] = useState(false)
@@ -113,6 +174,11 @@ export default function DashboardPage() {
     dependentPersonId: null as number | null,
     notes: '',
     installmentCount: 1,
+    splitMode: false,
+    splitParts: [
+      { spentBySelf: true, dependentPersonId: null as number | null, amount: '' },
+      { spentBySelf: true, dependentPersonId: null as number | null, amount: '' },
+    ] as Array<{ spentBySelf: boolean; dependentPersonId: number | null; amount: string }>,
   })
 
   const refresh = useCallback(async () => {
@@ -230,7 +296,10 @@ export default function DashboardPage() {
     setStatementImportCard(card)
     setStatementPreview(null)
     setStatementLineChoices({})
+    setStatementExcludedLineHashes([])
     setStatementImportBusy(false)
+    setStatementImportResult(null)
+    setStatementQuickDependentName('')
     if (statementFileInputRef.current) statementFileInputRef.current.value = ''
   }
 
@@ -238,7 +307,10 @@ export default function DashboardPage() {
     setStatementImportCard(null)
     setStatementPreview(null)
     setStatementLineChoices({})
+    setStatementExcludedLineHashes([])
     setStatementImportBusy(false)
+    setStatementImportResult(null)
+    setStatementQuickDependentName('')
     if (statementFileInputRef.current) statementFileInputRef.current.value = ''
   }
 
@@ -249,11 +321,13 @@ export default function DashboardPage() {
     try {
       const prev = await previewStatementImport(statementImportCard.id, file)
       setStatementPreview(prev)
-      const init: Record<string, { spentBySelf: boolean; dependentPersonId: number | null }> = {}
+      setStatementImportResult(null)
+      const init: Record<string, StatementLineChoice> = {}
       for (const line of prev.lines) {
-        init[line.lineHash] = { spentBySelf: true, dependentPersonId: null }
+        init[line.lineHash] = { mode: 'single', spentBySelf: true, dependentPersonId: null }
       }
       setStatementLineChoices(init)
+      setStatementExcludedLineHashes([])
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Erro ao ler a fatura')
     } finally {
@@ -261,37 +335,105 @@ export default function DashboardPage() {
     }
   }
 
+  const statementExcludedSet = useMemo(() => new Set(statementExcludedLineHashes), [statementExcludedLineHashes])
+
+  const statementIncludedLines = useMemo(() => {
+    if (!statementPreview?.lines.length) return []
+    return statementPreview.lines.filter((l) => !statementExcludedSet.has(l.lineHash))
+  }, [statementPreview, statementExcludedSet])
+
   const statementCommitReady = useMemo(() => {
     if (!statementPreview || statementPreview.lines.length === 0) return false
-    return statementPreview.lines.every((line) => {
+    if (statementIncludedLines.length === 0) return false
+    return statementIncludedLines.every((line) => {
       const ch = statementLineChoices[line.lineHash]
       if (!ch) return false
-      if (ch.spentBySelf) return true
-      return ch.dependentPersonId != null
+      if (ch.mode === 'single') {
+        if (ch.spentBySelf) return true
+        return ch.dependentPersonId != null
+      }
+      if (ch.parts.length < 2) return false
+      if (ch.parts.every((p) => p.spentBySelf)) return false
+      const totalLine = line.amount
+      let sum = 0
+      for (const p of ch.parts) {
+        const a = Number.parseFloat(p.amount.replace(',', '.'))
+        if (Number.isNaN(a) || a <= 0) return false
+        if (!p.spentBySelf && (p.dependentPersonId == null || p.dependentPersonId <= 0)) return false
+        sum += a
+      }
+      return Math.abs(sum - totalLine) <= 0.021
     })
-  }, [statementPreview, statementLineChoices])
+  }, [statementPreview, statementLineChoices, statementIncludedLines])
 
-  async function submitStatementImport() {
-    if (!statementImportCard || !statementPreview || !statementCommitReady) return
+  const statementLinesTotal = useMemo(() => {
+    if (!statementIncludedLines.length) return 0
+    return statementIncludedLines.reduce((s, l) => s + l.amount, 0)
+  }, [statementIncludedLines])
+
+  const statementExcludedLines = useMemo(() => {
+    if (!statementPreview?.lines.length) return []
+    return statementPreview.lines.filter((l) => statementExcludedSet.has(l.lineHash))
+  }, [statementPreview, statementExcludedSet])
+
+  useEffect(() => {
+    setStatementImportCard((prev) => {
+      if (!prev) return prev
+      const updated = cards.find((c) => c.id === prev.id)
+      return updated ?? prev
+    })
+  }, [cards])
+
+  async function registerQuickDependentOnStatementCard() {
+    if (!statementImportCard || !statementQuickDependentName.trim()) return
     setStatementImportBusy(true)
     setError(null)
     try {
-      await commitStatementImport(
+      await createDependent(statementImportCard.id, statementQuickDependentName.trim())
+      setStatementQuickDependentName('')
+      await refresh()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Erro ao adicionar pessoa')
+    } finally {
+      setStatementImportBusy(false)
+    }
+  }
+
+  async function submitStatementImport() {
+    if (!statementImportCard || !statementPreview || !statementCommitReady || statementIncludedLines.length === 0)
+      return
+    setStatementImportBusy(true)
+    setError(null)
+    try {
+      const result = await commitStatementImport(
         statementImportCard.id,
-        statementPreview.lines.map((line) => {
+        statementIncludedLines.map((line) => {
           const ch = statementLineChoices[line.lineHash]!
+          if (ch.mode === 'single') {
+            return {
+              lineHash: line.lineHash,
+              expenseDate: line.expenseDate,
+              amount: line.amount,
+              description: line.description,
+              spentBySelf: ch.spentBySelf,
+              dependentPersonId: ch.spentBySelf ? null : ch.dependentPersonId,
+            }
+          }
           return {
             lineHash: line.lineHash,
             expenseDate: line.expenseDate,
             amount: line.amount,
             description: line.description,
-            spentBySelf: ch.spentBySelf,
-            dependentPersonId: ch.spentBySelf ? null : ch.dependentPersonId,
+            splits: ch.parts.map((p) => ({
+              spentBySelf: p.spentBySelf,
+              dependentPersonId: p.spentBySelf ? null : p.dependentPersonId,
+              amount: Number.parseFloat(p.amount.replace(',', '.')),
+            })),
           }
         }),
       )
       await refresh()
-      closeStatementImport()
+      setStatementImportResult(result)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Erro ao salvar os gastos')
     } finally {
@@ -419,22 +561,63 @@ export default function DashboardPage() {
       dependentPersonId: null,
       notes: '',
       installmentCount: 1,
+      splitMode: false,
+      splitParts: [
+        { spentBySelf: true, dependentPersonId: null, amount: '' },
+        { spentBySelf: true, dependentPersonId: null, amount: '' },
+      ],
     })
     setExpenseModal(true)
   }
 
   function openEditExpense(ex: Expense) {
     setEditingExpense(ex)
-    setExpenseForm({
-      cardId: ex.cardId,
-      amount: String(ex.amount),
-      description: ex.description,
-      expenseDate: ex.expenseDate,
-      spentBySelf: ex.spentBySelf,
-      dependentPersonId: ex.dependentPersonId,
-      notes: ex.notes ?? '',
-      installmentCount: ex.installmentCount ?? 1,
-    })
+    const inst = ex.installmentCount ?? 1
+    const isSplit =
+      inst <= 1 && ex.splitGroupId != null && ex.splitGroupId !== '' && (ex.splitPartCount ?? 1) > 1
+
+    if (isSplit) {
+      const parts = expenses
+        .filter((e) => e.splitGroupId === ex.splitGroupId)
+        .sort((a, b) => (a.splitPartIndex ?? 0) - (b.splitPartIndex ?? 0))
+      const total =
+        ex.totalPurchaseAmount != null && !Number.isNaN(ex.totalPurchaseAmount)
+          ? ex.totalPurchaseAmount
+          : parts.reduce((s, p) => s + p.amount, 0)
+      const baseNotes = stripSplitNotesSuffix(parts[0]?.notes ?? ex.notes)
+      setExpenseForm({
+        cardId: ex.cardId,
+        amount: String(total),
+        description: ex.description,
+        expenseDate: ex.expenseDate,
+        spentBySelf: true,
+        dependentPersonId: null,
+        notes: baseNotes,
+        installmentCount: 1,
+        splitMode: true,
+        splitParts: parts.map((p) => ({
+          spentBySelf: p.spentBySelf,
+          dependentPersonId: p.dependentPersonId,
+          amount: String(p.amount),
+        })),
+      })
+    } else {
+      setExpenseForm({
+        cardId: ex.cardId,
+        amount: String(ex.amount),
+        description: ex.description,
+        expenseDate: ex.expenseDate,
+        spentBySelf: ex.spentBySelf,
+        dependentPersonId: ex.dependentPersonId,
+        notes: ex.notes ?? '',
+        installmentCount: ex.installmentCount ?? 1,
+        splitMode: false,
+        splitParts: [
+          { spentBySelf: true, dependentPersonId: null, amount: '' },
+          { spentBySelf: true, dependentPersonId: null, amount: '' },
+        ],
+      })
+    }
     setExpenseModal(true)
   }
 
@@ -447,17 +630,92 @@ export default function DashboardPage() {
       return
     }
     const notes = expenseForm.notes.trim()
-    const inst = editingExpense ? 1 : Math.max(1, Math.min(120, expenseForm.installmentCount || 1))
-    if (!editingExpense && inst > 1 && amount / inst < 0.01) {
-      setError('Valor por parcela muito baixo')
-      return
-    }
-    if (!expenseForm.spentBySelf && (expenseForm.dependentPersonId == null || expenseForm.dependentPersonId <= 0)) {
-      setError('Selecione quem gastou ou marque como Eu')
-      return
-    }
-    try {
-      if (editingExpense) {
+    const instNew = Math.max(1, Math.min(120, expenseForm.installmentCount || 1))
+
+    if (editingExpense) {
+      const instEd = editingExpense.installmentCount ?? 1
+      if (instEd > 1) {
+        if (!expenseForm.spentBySelf && (expenseForm.dependentPersonId == null || expenseForm.dependentPersonId <= 0)) {
+          setError('Selecione quem gastou ou marque como Eu')
+          return
+        }
+        try {
+          await updateExpense(editingExpense.id, {
+            cardId: expenseForm.cardId,
+            amount,
+            description: expenseForm.description.trim(),
+            expenseDate: expenseForm.expenseDate,
+            spentBySelf: expenseForm.spentBySelf,
+            dependentPersonId: expenseForm.spentBySelf ? null : expenseForm.dependentPersonId,
+            notes: notes === '' ? null : notes,
+          })
+          setExpenseModal(false)
+          await refresh()
+        } catch (err) {
+          setError(err instanceof Error ? err.message : 'Erro ao salvar gasto')
+        }
+        return
+      }
+
+      if (expenseForm.splitMode) {
+        if (expenseForm.splitParts.length < 2) {
+          setError('Inclua ao menos duas partes para dividir')
+          return
+        }
+        let sum = 0
+        const splits: { spentBySelf: boolean; dependentPersonId: number | null; amount: number }[] = []
+        for (const p of expenseForm.splitParts) {
+          const pa = Number.parseFloat(p.amount.replace(',', '.'))
+          if (Number.isNaN(pa) || pa <= 0) {
+            setError('Cada parte precisa de um valor válido')
+            return
+          }
+          if (!p.spentBySelf && (p.dependentPersonId == null || p.dependentPersonId <= 0)) {
+            setError('Selecione a pessoa em cada parte ou marque Eu')
+            return
+          }
+          sum += pa
+          splits.push({
+            spentBySelf: p.spentBySelf,
+            dependentPersonId: p.spentBySelf ? null : p.dependentPersonId,
+            amount: pa,
+          })
+        }
+        if (Math.abs(sum - amount) > 0.021) {
+          setError('A soma das partes deve fechar com o valor total')
+          return
+        }
+        if (!splits.some((p) => !p.spentBySelf)) {
+          setError(
+            'Em um gasto dividido, ao menos uma parte deve ser de outra pessoa cadastrada neste cartão. Se só você pagou, desmarque a divisão.',
+          )
+          return
+        }
+        try {
+          await updateExpense(editingExpense.id, {
+            cardId: expenseForm.cardId,
+            amount,
+            description: expenseForm.description.trim(),
+            expenseDate: expenseForm.expenseDate,
+            spentBySelf: true,
+            dependentPersonId: null,
+            notes: notes === '' ? null : notes,
+            installmentCount: 1,
+            splits,
+          })
+          setExpenseModal(false)
+          await refresh()
+        } catch (err) {
+          setError(err instanceof Error ? err.message : 'Erro ao salvar gasto')
+        }
+        return
+      }
+
+      if (!expenseForm.spentBySelf && (expenseForm.dependentPersonId == null || expenseForm.dependentPersonId <= 0)) {
+        setError('Selecione quem gastou ou marque como Eu')
+        return
+      }
+      try {
         await updateExpense(editingExpense.id, {
           cardId: expenseForm.cardId,
           amount,
@@ -466,19 +724,92 @@ export default function DashboardPage() {
           spentBySelf: expenseForm.spentBySelf,
           dependentPersonId: expenseForm.spentBySelf ? null : expenseForm.dependentPersonId,
           notes: notes === '' ? null : notes,
+          installmentCount: 1,
         })
-      } else {
+        setExpenseModal(false)
+        await refresh()
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Erro ao salvar gasto')
+      }
+      return
+    }
+
+    if (instNew > 1 && amount / instNew < 0.01) {
+      setError('Valor por parcela muito baixo')
+      return
+    }
+    if (expenseForm.splitMode) {
+      if (instNew > 1) {
+        setError('Desative parcelas ou desative a divisão entre pessoas')
+        return
+      }
+      if (expenseForm.splitParts.length < 2) {
+        setError('Inclua ao menos duas partes para dividir')
+        return
+      }
+      let sum = 0
+      const splits: { spentBySelf: boolean; dependentPersonId: number | null; amount: number }[] = []
+      for (const p of expenseForm.splitParts) {
+        const pa = Number.parseFloat(p.amount.replace(',', '.'))
+        if (Number.isNaN(pa) || pa <= 0) {
+          setError('Cada parte precisa de um valor válido')
+          return
+        }
+        if (!p.spentBySelf && (p.dependentPersonId == null || p.dependentPersonId <= 0)) {
+          setError('Selecione a pessoa em cada parte ou marque Eu')
+          return
+        }
+        sum += pa
+        splits.push({
+          spentBySelf: p.spentBySelf,
+          dependentPersonId: p.spentBySelf ? null : p.dependentPersonId,
+          amount: pa,
+        })
+      }
+      if (Math.abs(sum - amount) > 0.021) {
+        setError('A soma das partes deve fechar com o valor total')
+        return
+      }
+      if (!splits.some((p) => !p.spentBySelf)) {
+        setError(
+          'Em um gasto dividido, ao menos uma parte deve ser de outra pessoa cadastrada neste cartão. Se só você pagou, desmarque a divisão e use um único lançamento em "Eu".',
+        )
+        return
+      }
+      try {
         await createExpense({
           cardId: expenseForm.cardId,
           amount,
           description: expenseForm.description.trim(),
           expenseDate: expenseForm.expenseDate,
-          spentBySelf: expenseForm.spentBySelf,
-          dependentPersonId: expenseForm.spentBySelf ? null : expenseForm.dependentPersonId,
+          spentBySelf: true,
+          dependentPersonId: null,
           notes: notes === '' ? null : notes,
-          installmentCount: inst,
+          installmentCount: 1,
+          splits,
         })
+        setExpenseModal(false)
+        await refresh()
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Erro ao salvar gasto')
       }
+      return
+    }
+    if (!expenseForm.spentBySelf && (expenseForm.dependentPersonId == null || expenseForm.dependentPersonId <= 0)) {
+      setError('Selecione quem gastou ou marque como Eu')
+      return
+    }
+    try {
+      await createExpense({
+        cardId: expenseForm.cardId,
+        amount,
+        description: expenseForm.description.trim(),
+        expenseDate: expenseForm.expenseDate,
+        spentBySelf: expenseForm.spentBySelf,
+        dependentPersonId: expenseForm.spentBySelf ? null : expenseForm.dependentPersonId,
+        notes: notes === '' ? null : notes,
+        installmentCount: instNew,
+      })
       setExpenseModal(false)
       await refresh()
     } catch (err) {
@@ -489,6 +820,8 @@ export default function DashboardPage() {
   async function removeExpense(ex: Expense) {
     const hasGroup =
       (ex.installmentCount ?? 1) > 1 && ex.installmentGroupId != null && ex.installmentGroupId !== ''
+    const hasSplitGroup =
+      (ex.splitPartCount ?? 1) > 1 && ex.splitGroupId != null && ex.splitGroupId !== ''
 
     let deleteGroup = false
     if (hasGroup) {
@@ -499,6 +832,16 @@ export default function DashboardPage() {
       ) {
         deleteGroup = true
       } else if (!confirm('Excluir apenas esta parcela?')) {
+        return
+      }
+    } else if (hasSplitGroup) {
+      if (
+        confirm(
+          `Excluir todas as ${ex.splitPartCount} partes deste gasto dividido?\n\nOK = todas\nCancelar = excluir só esta linha`,
+        )
+      ) {
+        deleteGroup = true
+      } else if (!confirm('Excluir apenas esta parte?')) {
         return
       }
     } else if (!confirm('Excluir este gasto?')) {
@@ -965,6 +1308,11 @@ export default function DashboardPage() {
                             {ex.installmentIndex}/{ex.installmentCount}
                           </span>
                         )}
+                        {(ex.splitPartCount ?? 1) > 1 && (
+                          <span className="ml-1 inline-flex rounded-md bg-cyan-500/15 px-1.5 py-0.5 text-[10px] font-medium text-cyan-200 ring-1 ring-cyan-500/30">
+                            Div. {ex.splitPartIndex}/{ex.splitPartCount}
+                          </span>
+                        )}
                         {ex.notes && (
                           <span className="mt-0.5 block truncate text-xs text-zinc-500">{ex.notes}</span>
                         )}
@@ -1072,7 +1420,79 @@ export default function DashboardPage() {
                 <span className="text-xs text-zinc-500">Lendo arquivo…</span>
               )}
             </div>
-            {statementPreview && (
+
+            <div className="rounded-xl border border-white/10 bg-zinc-900/40 p-3">
+              <p className="mb-2 text-xs font-medium text-zinc-400">Pessoas neste cartão (cadastro rápido)</p>
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                <input
+                  value={statementQuickDependentName}
+                  onChange={(e) => setStatementQuickDependentName(e.target.value)}
+                  placeholder="Nome da pessoa responsável…"
+                  className="min-w-0 flex-1 rounded-lg border border-white/10 bg-zinc-900/80 px-3 py-2 text-sm text-white outline-none focus:ring-2 focus:ring-violet-500/50"
+                />
+                <button
+                  type="button"
+                  disabled={statementImportBusy || !statementQuickDependentName.trim()}
+                  onClick={() => void registerQuickDependentOnStatementCard()}
+                  className="shrink-0 rounded-lg border border-violet-500/40 bg-violet-600/25 px-4 py-2 text-sm font-medium text-violet-100 hover:bg-violet-600/40 disabled:opacity-40"
+                >
+                  Adicionar pessoa
+                </button>
+              </div>
+            </div>
+
+            {statementImportResult && (
+              <div className="space-y-3 rounded-xl border border-emerald-500/35 bg-emerald-950/25 p-4 ring-1 ring-emerald-500/20">
+                <p className="text-sm font-semibold text-emerald-100">Importação concluída</p>
+                <ul className="space-y-1 text-sm text-zinc-300">
+                  <li>
+                    <span className="text-zinc-500">Total importado (soma das linhas): </span>
+                    <span className="font-mono font-semibold text-white">{brl(statementImportResult.totalImportedAmount)}</span>
+                  </li>
+                  <li>
+                    <span className="text-zinc-500">Linhas da fatura registradas: </span>
+                    <span className="font-mono text-white">{statementImportResult.importedStatementLines}</span>
+                  </li>
+                  <li>
+                    <span className="text-zinc-500">Gastos criados no cartão: </span>
+                    <span className="font-mono text-white">{statementImportResult.imported}</span>
+                    {statementImportResult.imported !== statementImportResult.importedStatementLines && (
+                      <span className="ml-1 text-xs text-zinc-500">(inclui partes de valores divididos)</span>
+                    )}
+                  </li>
+                  {statementImportResult.skippedDuplicates > 0 && (
+                    <li className="text-amber-200/90">
+                      Duplicados ignorados neste envio: {statementImportResult.skippedDuplicates}
+                    </li>
+                  )}
+                </ul>
+                <div className="flex flex-wrap gap-2 pt-1">
+                  <button
+                    type="button"
+                    disabled={statementImportBusy}
+                    onClick={() => {
+                      setStatementImportResult(null)
+                      setStatementPreview(null)
+                      setStatementLineChoices({})
+                      setStatementExcludedLineHashes([])
+                      if (statementFileInputRef.current) statementFileInputRef.current.value = ''
+                    }}
+                    className="rounded-xl border border-white/15 bg-white/5 px-4 py-2 text-sm text-zinc-200 hover:bg-white/10"
+                  >
+                    Importar outro arquivo
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => closeStatementImport()}
+                    className="rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 px-4 py-2 text-sm font-semibold text-white"
+                  >
+                    Fechar
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {statementPreview && !statementImportResult && (
               <>
                 {statementPreview.skippedAlreadyImported > 0 && (
                   <p className="text-xs text-amber-400/90">
@@ -1085,6 +1505,28 @@ export default function DashboardPage() {
                   </p>
                 ) : (
                   <>
+                    <div className="flex flex-wrap items-end justify-between gap-3 rounded-xl border border-violet-500/25 bg-violet-950/20 px-3 py-2.5">
+                      <div>
+                        <p className="text-xs font-medium text-violet-200/90">Total a importar (linhas selecionadas)</p>
+                        <p className="font-mono text-lg font-semibold tabular-nums text-white">{brl(statementLinesTotal)}</p>
+                        <p className="mt-1 text-xs text-zinc-500">
+                          {statementIncludedLines.length} de {statementPreview.lines.length} linha(s) no arquivo
+                          {statementExcludedLines.length > 0 && (
+                            <span className="text-amber-200/80"> — {statementExcludedLines.length} ignorada(s)</span>
+                          )}
+                        </p>
+                      </div>
+                      <p className="max-w-sm text-xs text-zinc-500">
+                        Remova lançamentos que não são gastos da fatura (ex.: valores pendentes ou recebidos). Atribua
+                        cada linha restante ou divida o valor entre pessoas.
+                      </p>
+                    </div>
+                    {statementIncludedLines.length === 0 && statementPreview.lines.length > 0 && (
+                      <p className="rounded-lg border border-amber-500/30 bg-amber-950/20 px-3 py-2 text-sm text-amber-100">
+                        Todas as linhas estão fora da importação. Restaure ao menos uma linha na lista abaixo ou
+                        escolha outro arquivo.
+                      </p>
+                    )}
                     <div className="max-h-[min(50vh,400px)] overflow-auto rounded-xl border border-white/10">
                       <table className="w-full text-left text-sm">
                         <thead className="sticky top-0 z-[1] bg-[oklch(0.19_0.025_280)]">
@@ -1092,18 +1534,20 @@ export default function DashboardPage() {
                             <th className="px-3 py-2.5 font-medium">Data</th>
                             <th className="px-3 py-2.5 font-medium">Descrição</th>
                             <th className="px-3 py-2.5 text-right font-medium">Valor</th>
-                            <th className="px-3 py-2.5 font-medium">Quem gastou</th>
+                            <th className="min-w-[200px] px-3 py-2.5 font-medium">Responsáveis</th>
+                            <th className="w-12 px-2 py-2.5" />
                           </tr>
                         </thead>
                         <tbody>
-                          {statementPreview.lines.map((line) => {
-                            const ch = statementLineChoices[line.lineHash] ?? {
+                          {statementIncludedLines.map((line) => {
+                            const ch: StatementLineChoice = statementLineChoices[line.lineHash] ?? {
+                              mode: 'single',
                               spentBySelf: true,
                               dependentPersonId: null,
                             }
                             const deps = statementImportCard.dependents
                             return (
-                              <tr key={line.lineHash} className="border-b border-white/5">
+                              <tr key={line.lineHash} className="border-b border-white/5 align-top">
                                 <td className="whitespace-nowrap px-3 py-2.5 font-mono text-zinc-400">
                                   {formatDate(line.expenseDate)}
                                 </td>
@@ -1112,33 +1556,207 @@ export default function DashboardPage() {
                                   {brl(line.amount)}
                                 </td>
                                 <td className="px-3 py-2.5">
-                                  <select
-                                    value={
-                                      ch.spentBySelf
-                                        ? 'self'
-                                        : ch.dependentPersonId != null
-                                          ? String(ch.dependentPersonId)
-                                          : 'self'
+                                  <div className="flex flex-col gap-2">
+                                    <select
+                                      value={ch.mode}
+                                      onChange={(e) => {
+                                        const mode = e.target.value as 'single' | 'split'
+                                        if (mode === 'single') {
+                                          setStatementLineChoices((prev) => ({
+                                            ...prev,
+                                            [line.lineHash]: {
+                                              mode: 'single',
+                                              spentBySelf: true,
+                                              dependentPersonId: null,
+                                            },
+                                          }))
+                                        } else {
+                                          const firstDep = deps[0]?.id ?? null
+                                          setStatementLineChoices((prev) => ({
+                                            ...prev,
+                                            [line.lineHash]: {
+                                              mode: 'split',
+                                              parts: [
+                                                { spentBySelf: true, dependentPersonId: null, amount: '' },
+                                                {
+                                                  spentBySelf: firstDep == null,
+                                                  dependentPersonId: firstDep,
+                                                  amount: '',
+                                                },
+                                              ],
+                                            },
+                                          }))
+                                        }
+                                      }}
+                                      className="w-full rounded-lg border border-white/10 bg-zinc-900/80 px-2 py-1.5 text-xs text-white outline-none focus:ring-2 focus:ring-violet-500/50"
+                                    >
+                                      <option value="single">Uma pessoa</option>
+                                      <option value="split">Dividir valor</option>
+                                    </select>
+                                    {ch.mode === 'single' ? (
+                                      <select
+                                        value={dependentSelectValue(ch.spentBySelf, ch.dependentPersonId)}
+                                        onChange={(e) => {
+                                          const v = e.target.value
+                                          setStatementLineChoices((prev) => ({
+                                            ...prev,
+                                            [line.lineHash]:
+                                              v === 'self'
+                                                ? { mode: 'single', spentBySelf: true, dependentPersonId: null }
+                                                : {
+                                                    mode: 'single',
+                                                    spentBySelf: false,
+                                                    dependentPersonId: Number.parseInt(v, 10),
+                                                  },
+                                          }))
+                                        }}
+                                        className="w-full min-w-[140px] rounded-lg border border-white/10 bg-zinc-900/80 px-2 py-1.5 text-xs text-white outline-none focus:ring-2 focus:ring-violet-500/50"
+                                      >
+                                        <option value="self">Eu (titular)</option>
+                                        {deps.map((d) => (
+                                          <option key={d.id} value={String(d.id)}>
+                                            {d.name}
+                                          </option>
+                                        ))}
+                                      </select>
+                                    ) : (
+                                      <div className="space-y-2 rounded-lg border border-white/10 bg-black/20 p-2">
+                                        {ch.parts.map((part, idx) => (
+                                          <div
+                                            key={`${line.lineHash}-${idx}-${dependentSelectValue(part.spentBySelf, part.dependentPersonId)}`}
+                                            className="flex flex-wrap items-center gap-2"
+                                          >
+                                            <select
+                                              value={dependentSelectValue(part.spentBySelf, part.dependentPersonId)}
+                                              onChange={(e) => {
+                                                const v = e.target.value
+                                                setStatementLineChoices((prev) => {
+                                                  const cur = prev[line.lineHash]
+                                                  if (!cur || cur.mode !== 'split') return prev
+                                                  const nextParts = cur.parts.map((p, j) =>
+                                                    j === idx
+                                                      ? v === 'self'
+                                                        ? { ...p, spentBySelf: true, dependentPersonId: null }
+                                                        : { ...p, spentBySelf: false, dependentPersonId: Number.parseInt(v, 10) }
+                                                      : p,
+                                                  )
+                                                  return { ...prev, [line.lineHash]: { mode: 'split', parts: nextParts } }
+                                                })
+                                              }}
+                                              className="min-w-[120px] flex-1 rounded border border-white/10 bg-zinc-900/80 px-2 py-1 text-xs text-white"
+                                            >
+                                              <option value="self">Eu</option>
+                                              {deps.map((d) => (
+                                                <option key={d.id} value={String(d.id)}>
+                                                  {d.name}
+                                                </option>
+                                              ))}
+                                            </select>
+                                            <input
+                                              value={part.amount}
+                                              onChange={(e) => {
+                                                const val = e.target.value
+                                                setStatementLineChoices((prev) => {
+                                                  const cur = prev[line.lineHash]
+                                                  if (!cur || cur.mode !== 'split') return prev
+                                                  const nextParts = cur.parts.map((p, j) =>
+                                                    j === idx ? { ...p, amount: val } : p,
+                                                  )
+                                                  return { ...prev, [line.lineHash]: { mode: 'split', parts: nextParts } }
+                                                })
+                                              }}
+                                              inputMode="decimal"
+                                              placeholder="R$"
+                                              className="w-24 rounded border border-white/10 bg-zinc-900/80 px-2 py-1 font-mono text-xs text-white"
+                                            />
+                                            {ch.parts.length > 2 && (
+                                              <button
+                                                type="button"
+                                                className="text-xs text-red-400 hover:text-red-300"
+                                                onClick={() =>
+                                                  setStatementLineChoices((prev) => {
+                                                    const cur = prev[line.lineHash]
+                                                    if (!cur || cur.mode !== 'split' || cur.parts.length <= 2)
+                                                      return prev
+                                                    return {
+                                                      ...prev,
+                                                      [line.lineHash]: {
+                                                        mode: 'split',
+                                                        parts: cur.parts.filter((_, j) => j !== idx),
+                                                      },
+                                                    }
+                                                  })
+                                                }
+                                              >
+                                                Remover
+                                              </button>
+                                            )}
+                                          </div>
+                                        ))}
+                                        <div className="flex flex-wrap gap-2">
+                                          <button
+                                            type="button"
+                                            className="text-xs text-violet-300 hover:text-violet-200"
+                                            onClick={() =>
+                                              setStatementLineChoices((prev) => {
+                                                const cur = prev[line.lineHash]
+                                                if (!cur || cur.mode !== 'split') return prev
+                                                return {
+                                                  ...prev,
+                                                  [line.lineHash]: {
+                                                    mode: 'split',
+                                                    parts: [
+                                                      ...cur.parts,
+                                                      { spentBySelf: true, dependentPersonId: null, amount: '' },
+                                                    ],
+                                                  },
+                                                }
+                                              })
+                                            }
+                                          >
+                                            + Parte
+                                          </button>
+                                          <button
+                                            type="button"
+                                            className="text-xs text-zinc-400 hover:text-zinc-200"
+                                            onClick={() => {
+                                              const n = ch.parts.length
+                                              if (n < 1) return
+                                              const amounts = equalPartsAmountStrings(line.amount, n)
+                                              setStatementLineChoices((prev) => {
+                                                const cur = prev[line.lineHash]
+                                                if (!cur || cur.mode !== 'split') return prev
+                                                return {
+                                                  ...prev,
+                                                  [line.lineHash]: {
+                                                    mode: 'split',
+                                                    parts: cur.parts.map((p, i) => ({ ...p, amount: amounts[i] ?? '' })),
+                                                  },
+                                                }
+                                              })
+                                            }}
+                                          >
+                                            Dividir igualmente
+                                          </button>
+                                        </div>
+                                      </div>
+                                    )}
+                                  </div>
+                                </td>
+                                <td className="align-top px-2 py-2.5">
+                                  <button
+                                    type="button"
+                                    title="Não importar esta linha"
+                                    aria-label="Não importar esta linha"
+                                    onClick={() =>
+                                      setStatementExcludedLineHashes((prev) =>
+                                        prev.includes(line.lineHash) ? prev : [...prev, line.lineHash],
+                                      )
                                     }
-                                    onChange={(e) => {
-                                      const v = e.target.value
-                                      setStatementLineChoices((prev) => ({
-                                        ...prev,
-                                        [line.lineHash]:
-                                          v === 'self'
-                                            ? { spentBySelf: true, dependentPersonId: null }
-                                            : { spentBySelf: false, dependentPersonId: Number.parseInt(v, 10) },
-                                      }))
-                                    }}
-                                    className="w-full min-w-[140px] rounded-lg border border-white/10 bg-zinc-900/80 px-2 py-1.5 text-xs text-white outline-none focus:ring-2 focus:ring-violet-500/50"
+                                    className="rounded-lg p-2 text-zinc-500 hover:bg-amber-500/15 hover:text-amber-200"
                                   >
-                                    <option value="self">Eu (titular)</option>
-                                    {deps.map((d) => (
-                                      <option key={d.id} value={d.id}>
-                                        {d.name}
-                                      </option>
-                                    ))}
-                                  </select>
+                                    <Trash2 className="h-4 w-4" />
+                                  </button>
                                 </td>
                               </tr>
                             )
@@ -1146,9 +1764,43 @@ export default function DashboardPage() {
                         </tbody>
                       </table>
                     </div>
+                    {statementExcludedLines.length > 0 && (
+                      <div className="rounded-xl border border-white/10 bg-zinc-900/50 p-3">
+                        <p className="mb-2 text-xs font-medium text-zinc-400">
+                          Fora da importação ({statementExcludedLines.length}) — não serão salvas no cartão
+                        </p>
+                        <ul className="space-y-2">
+                          {statementExcludedLines.map((line) => (
+                            <li
+                              key={line.lineHash}
+                              className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-white/5 bg-black/20 px-3 py-2 text-sm"
+                            >
+                              <div className="min-w-0 flex-1">
+                                <span className="font-mono text-xs text-zinc-500">{formatDate(line.expenseDate)}</span>
+                                <span className="ml-2 text-zinc-300">{line.description}</span>
+                                <span className="ml-2 font-mono text-zinc-200">{brl(line.amount)}</span>
+                              </div>
+                              <button
+                                type="button"
+                                className="shrink-0 text-xs font-medium text-violet-300 hover:text-violet-200"
+                                onClick={() =>
+                                  setStatementExcludedLineHashes((prev) =>
+                                    prev.filter((h) => h !== line.lineHash),
+                                  )
+                                }
+                              >
+                                Voltar à importação
+                              </button>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
                     <button
                       type="button"
-                      disabled={!statementCommitReady || statementImportBusy}
+                      disabled={
+                        !statementCommitReady || statementImportBusy || statementIncludedLines.length === 0
+                      }
                       onClick={() => void submitStatementImport()}
                       className="w-full rounded-xl bg-gradient-to-r from-violet-600 to-fuchsia-600 py-3 text-sm font-semibold text-white shadow-lg shadow-violet-900/30 disabled:cursor-not-allowed disabled:opacity-40"
                     >
@@ -1304,7 +1956,9 @@ export default function DashboardPage() {
       <Modal
         open={expenseModal}
         onClose={() => setExpenseModal(false)}
-        title={editingExpense ? 'Editar gasto' : 'Novo gasto'}
+        title={
+          editingExpense ? (expenseForm.splitMode ? 'Editar gasto dividido' : 'Editar gasto') : 'Novo gasto'
+        }
       >
         <form onSubmit={(e) => void submitExpense(e)} className="space-y-4">
           <div>
@@ -1312,11 +1966,18 @@ export default function DashboardPage() {
             <select
               required
               value={expenseForm.cardId || ''}
-              onChange={(e) => setExpenseForm((f) => ({ ...f, cardId: Number(e.target.value) }))}
+              onChange={(e) => {
+                const newCardId = Number(e.target.value)
+                setExpenseForm((f) => ({
+                  ...f,
+                  cardId: newCardId,
+                  splitParts: f.splitMode ? fixSplitPartsForNewCard(f.splitParts, newCardId, cards) : f.splitParts,
+                }))
+              }}
               className="w-full rounded-xl border border-white/10 bg-zinc-900/80 px-3 py-2.5 text-sm text-white outline-none focus:ring-2 focus:ring-violet-500/50"
             >
               {cards.map((c) => (
-                <option key={c.id} value={c.id}>
+                <option key={c.id} value={String(c.id)}>
                   {c.name}
                 </option>
               ))}
@@ -1330,12 +1991,14 @@ export default function DashboardPage() {
                 min={1}
                 max={120}
                 value={expenseForm.installmentCount}
-                onChange={(e) =>
+                onChange={(e) => {
+                  const n = Math.max(1, Math.min(120, Number.parseInt(e.target.value, 10) || 1))
                   setExpenseForm((f) => ({
                     ...f,
-                    installmentCount: Math.max(1, Math.min(120, Number.parseInt(e.target.value, 10) || 1)),
+                    installmentCount: n,
+                    splitMode: n > 1 ? false : f.splitMode,
                   }))
-                }
+                }}
                 className="w-full rounded-xl border border-white/10 bg-zinc-900/80 px-3 py-2.5 font-mono text-sm text-white outline-none focus:ring-2 focus:ring-violet-500/50"
               />
               <p className="mt-1 text-xs text-zinc-500">
@@ -1350,6 +2013,14 @@ export default function DashboardPage() {
               {editingExpense.installmentCount}). Para remover tudo, use excluir e escolha apagar todas as parcelas.
             </p>
           )}
+          {editingExpense &&
+            (editingExpense.splitPartCount ?? 1) > 1 &&
+            expenseForm.splitMode && (
+              <p className="rounded-lg bg-cyan-500/10 px-3 py-2 text-xs text-cyan-200 ring-1 ring-cyan-500/25">
+                As {editingExpense.splitPartCount} partes desta divisão aparecem abaixo. Ao salvar, o grupo inteiro é
+                substituído pelos valores e responsáveis que você definir.
+              </p>
+            )}
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="mb-1.5 block text-xs font-medium text-zinc-400">
@@ -1382,43 +2053,171 @@ export default function DashboardPage() {
               Divisão aproximada: <span className="font-mono text-zinc-200">{instPreview}</span>
             </p>
           )}
-          <div>
-            <label className="mb-1.5 block text-xs font-medium text-zinc-400">Quem gastou</label>
-            <select
-              value={
-                expenseForm.spentBySelf
-                  ? 'self'
-                  : expenseForm.dependentPersonId != null
-                    ? String(expenseForm.dependentPersonId)
-                    : 'self'
-              }
-              onChange={(e) => {
-                const v = e.target.value
-                if (v === 'self') {
-                  setExpenseForm((f) => ({ ...f, spentBySelf: true, dependentPersonId: null }))
-                } else {
-                  setExpenseForm((f) => ({
-                    ...f,
-                    spentBySelf: false,
-                    dependentPersonId: Number.parseInt(v, 10),
-                  }))
+          {(!editingExpense || (editingExpense.installmentCount ?? 1) <= 1) && (
+            <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-white/10 bg-zinc-900/40 p-3">
+              <input
+                type="checkbox"
+                checked={expenseForm.splitMode}
+                disabled={
+                  (!!editingExpense && (editingExpense.installmentCount ?? 1) > 1) ||
+                  (!editingExpense && expenseForm.installmentCount > 1)
                 }
-              }}
-              className="w-full rounded-xl border border-white/10 bg-zinc-900/80 px-3 py-2.5 text-sm text-white outline-none focus:ring-2 focus:ring-violet-500/50"
-            >
-              <option value="self">Eu (titular)</option>
-              {(cards.find((c) => c.id === expenseForm.cardId)?.dependents ?? []).map((d) => (
-                <option key={d.id} value={d.id}>
-                  {d.name}
-                </option>
-              ))}
-            </select>
-            {(cards.find((c) => c.id === expenseForm.cardId)?.dependents ?? []).length === 0 && (
-              <p className="mt-1 text-xs text-amber-400/90">
-                Cadastre pessoas no cartão (editar cartão) para atribuir gasto a alguém além de você.
-              </p>
-            )}
-          </div>
+                onChange={(e) =>
+                  setExpenseForm((f) => {
+                    if (!e.target.checked) return { ...f, splitMode: false }
+                    const d0 = (cards.find((c) => c.id === f.cardId)?.dependents ?? [])[0]
+                    const second = d0
+                      ? { spentBySelf: false, dependentPersonId: d0.id, amount: '' }
+                      : { spentBySelf: true, dependentPersonId: null, amount: '' }
+                    return {
+                      ...f,
+                      splitMode: true,
+                      splitParts: [{ spentBySelf: true, dependentPersonId: null, amount: '' }, second],
+                    }
+                  })
+                }
+                className="mt-1 rounded border-white/20"
+              />
+              <span>
+                <span className="block text-sm font-medium text-zinc-200">Dividir entre duas ou mais pessoas</span>
+                <span className="mt-0.5 block text-xs text-zinc-500">
+                  Cada parte vira um lançamento no cartão (mesma data). Ao editar, você pode ativar ou desativar a
+                  divisão (exceto em compras parceladas por mês). Ao menos uma parte deve ser de outra pessoa
+                  cadastrada neste cartão. Incompatível com parcelamento em meses diferentes.
+                </span>
+              </span>
+            </label>
+          )}
+          {!expenseForm.splitMode ? (
+            <div>
+              <label className="mb-1.5 block text-xs font-medium text-zinc-400">Quem gastou</label>
+              <select
+                value={dependentSelectValue(expenseForm.spentBySelf, expenseForm.dependentPersonId)}
+                onChange={(e) => {
+                  const v = e.target.value
+                  if (v === 'self') {
+                    setExpenseForm((f) => ({ ...f, spentBySelf: true, dependentPersonId: null }))
+                  } else {
+                    setExpenseForm((f) => ({
+                      ...f,
+                      spentBySelf: false,
+                      dependentPersonId: Number.parseInt(v, 10),
+                    }))
+                  }
+                }}
+                className="w-full rounded-xl border border-white/10 bg-zinc-900/80 px-3 py-2.5 text-sm text-white outline-none focus:ring-2 focus:ring-violet-500/50"
+              >
+                <option value="self">Eu (titular)</option>
+                {(cards.find((c) => c.id === expenseForm.cardId)?.dependents ?? []).map((d) => (
+                  <option key={d.id} value={String(d.id)}>
+                    {d.name}
+                  </option>
+                ))}
+              </select>
+              {(cards.find((c) => c.id === expenseForm.cardId)?.dependents ?? []).length === 0 && (
+                <p className="mt-1 text-xs text-amber-400/90">
+                  Cadastre pessoas no cartão (editar cartão) para atribuir gasto a alguém além de você.
+                </p>
+              )}
+            </div>
+          ) : (
+            <div className="rounded-xl border border-cyan-500/25 bg-cyan-950/20 p-3 ring-1 ring-cyan-500/15">
+              <p className="mb-2 text-xs font-medium text-cyan-200/90">Partes do valor (deve fechar com o total)</p>
+              <div className="space-y-2">
+                {expenseForm.splitParts.map((part, idx) => {
+                  const deps = cards.find((c) => c.id === expenseForm.cardId)?.dependents ?? []
+                  return (
+                    <div
+                      key={`${idx}-${dependentSelectValue(part.spentBySelf, part.dependentPersonId)}`}
+                      className="flex flex-wrap items-center gap-2"
+                    >
+                      <select
+                        value={dependentSelectValue(part.spentBySelf, part.dependentPersonId)}
+                        onChange={(e) => {
+                          const v = e.target.value
+                          setExpenseForm((f) => ({
+                            ...f,
+                            splitParts: f.splitParts.map((p, j) =>
+                              j === idx
+                                ? v === 'self'
+                                  ? { ...p, spentBySelf: true, dependentPersonId: null }
+                                  : { ...p, spentBySelf: false, dependentPersonId: Number.parseInt(v, 10) }
+                                : p,
+                            ),
+                          }))
+                        }}
+                        className="min-w-[130px] flex-1 rounded-lg border border-white/10 bg-zinc-900/80 px-2 py-2 text-sm text-white"
+                      >
+                        <option value="self">Eu</option>
+                        {deps.map((d) => (
+                          <option key={d.id} value={String(d.id)}>
+                            {d.name}
+                          </option>
+                        ))}
+                      </select>
+                      <input
+                        value={part.amount}
+                        onChange={(e) =>
+                          setExpenseForm((f) => ({
+                            ...f,
+                            splitParts: f.splitParts.map((p, j) => (j === idx ? { ...p, amount: e.target.value } : p)),
+                          }))
+                        }
+                        inputMode="decimal"
+                        placeholder="Valor R$"
+                        className="w-28 rounded-lg border border-white/10 bg-zinc-900/80 px-2 py-2 font-mono text-sm text-white"
+                      />
+                      {expenseForm.splitParts.length > 2 && (
+                        <button
+                          type="button"
+                          className="text-xs text-red-400 hover:text-red-300"
+                          onClick={() =>
+                            setExpenseForm((f) =>
+                              f.splitParts.length <= 2
+                                ? f
+                                : { ...f, splitParts: f.splitParts.filter((_, j) => j !== idx) },
+                            )
+                          }
+                        >
+                          Remover
+                        </button>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+              <div className="mt-2 flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  className="text-xs text-cyan-300 hover:text-cyan-200"
+                  onClick={() =>
+                    setExpenseForm((f) => ({
+                      ...f,
+                      splitParts: [...f.splitParts, { spentBySelf: true, dependentPersonId: null, amount: '' }],
+                    }))
+                  }
+                >
+                  + Parte
+                </button>
+                <button
+                  type="button"
+                  className="text-xs text-zinc-400 hover:text-zinc-200"
+                  onClick={() => {
+                    const totalVal = Number.parseFloat(expenseForm.amount.replace(',', '.'))
+                    if (Number.isNaN(totalVal) || totalVal <= 0) return
+                    const n = expenseForm.splitParts.length
+                    const amounts = equalPartsAmountStrings(totalVal, n)
+                    setExpenseForm((f) => ({
+                      ...f,
+                      splitParts: f.splitParts.map((p, i) => ({ ...p, amount: amounts[i] ?? '' })),
+                    }))
+                  }}
+                >
+                  Dividir igualmente
+                </button>
+              </div>
+            </div>
+          )}
           <div>
             <label className="mb-1.5 block text-xs font-medium text-zinc-400">Descrição</label>
             <input

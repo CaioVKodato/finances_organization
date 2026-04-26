@@ -2,6 +2,7 @@ package com.finance.organization.service;
 
 import com.finance.organization.dto.ExpenseRequest;
 import com.finance.organization.dto.ExpenseResponse;
+import com.finance.organization.dto.ExpenseSplitPart;
 import com.finance.organization.model.Card;
 import com.finance.organization.model.CardDependent;
 import com.finance.organization.model.Expense;
@@ -53,6 +54,15 @@ public class ExpenseService {
         String desc = request.description().trim();
         String baseNotes = request.notes() == null || request.notes().isBlank() ? null : request.notes().trim();
 
+        List<ExpenseSplitPart> splits = request.splits();
+        if (splits != null && splits.size() >= 2) {
+            if (n > 1) {
+                throw new BadRequestException("Não é possível combinar parcelamento e divisão entre pessoas");
+            }
+            validateSplitPartsTotal(total, splits);
+            return persistSplitPurchase(card, request, splits);
+        }
+
         if (n == 1) {
             Expense e = new Expense();
             e.setCard(card);
@@ -91,6 +101,46 @@ public class ExpenseService {
         return out;
     }
 
+    private static void validateSplitPartsTotal(BigDecimal total, List<ExpenseSplitPart> splits) {
+        BigDecimal sumParts = BigDecimal.ZERO;
+        for (ExpenseSplitPart p : splits) {
+            sumParts = sumParts.add(p.amount());
+        }
+        if (sumParts.subtract(total).abs().compareTo(new BigDecimal("0.02")) > 0) {
+            throw new BadRequestException("A soma das partes deve igualar o valor total");
+        }
+    }
+
+    private List<ExpenseResponse> persistSplitPurchase(Card card, ExpenseRequest request, List<ExpenseSplitPart> splits) {
+        BigDecimal total = request.amount();
+        String desc = request.description().trim();
+        String baseNotes = request.notes() == null || request.notes().isBlank() ? null : request.notes().trim();
+        String splitGroupId = UUID.randomUUID().toString();
+        int m = splits.size();
+        List<ExpenseResponse> splitOut = new ArrayList<>();
+        for (int i = 0; i < m; i++) {
+            ExpenseSplitPart part = splits.get(i);
+            Expense ex = new Expense();
+            ex.setCard(card);
+            ex.setAmount(part.amount());
+            ex.setDescription(desc);
+            ex.setExpenseDate(request.expenseDate());
+            applySpenderFromSplitPart(ex, card, part);
+            String note = baseNotes == null
+                    ? ("Divisão " + (i + 1) + "/" + m)
+                    : (baseNotes + " — Divisão " + (i + 1) + "/" + m);
+            ex.setNotes(note);
+            ex.setInstallmentCount(1);
+            ex.setInstallmentIndex(1);
+            ex.setTotalPurchaseAmount(total);
+            ex.setSplitGroupId(splitGroupId);
+            ex.setSplitPartIndex(i + 1);
+            ex.setSplitPartCount(m);
+            splitOut.add(toResponse(expenseRepository.save(ex)));
+        }
+        return splitOut;
+    }
+
     private void applySpender(Expense e, Card card, ExpenseRequest request) {
         boolean self = Boolean.TRUE.equals(request.spentBySelf());
         e.setSpentBySelf(self);
@@ -103,6 +153,22 @@ public class ExpenseService {
         }
         CardDependent dep = cardDependentRepository
                 .findByIdAndCard_Id(request.dependentPersonId(), card.getId())
+                .orElseThrow(() -> new BadRequestException("Pessoa não pertence a este cartão"));
+        e.setDependentPerson(dep);
+    }
+
+    private void applySpenderFromSplitPart(Expense e, Card card, ExpenseSplitPart part) {
+        boolean self = Boolean.TRUE.equals(part.spentBySelf());
+        e.setSpentBySelf(self);
+        if (self) {
+            e.setDependentPerson(null);
+            return;
+        }
+        if (part.dependentPersonId() == null) {
+            throw new BadRequestException("Selecione quem gastou em cada parte da divisão");
+        }
+        CardDependent dep = cardDependentRepository
+                .findByIdAndCard_Id(part.dependentPersonId(), card.getId())
                 .orElseThrow(() -> new BadRequestException("Pessoa não pertence a este cartão"));
         e.setDependentPerson(dep);
     }
@@ -127,13 +193,69 @@ public class ExpenseService {
             throw new NotFoundException("Gasto não encontrado");
         }
         Card card = cardService.getEntityForUser(request.cardId(), userId);
+        int requestedInstallments = request.installmentCount() == null ? 1 : request.installmentCount();
+        if (requestedInstallments > 1 && request.splits() != null && request.splits().size() >= 2) {
+            throw new BadRequestException("Não é possível combinar parcelamento e divisão entre pessoas");
+        }
+
+        boolean wasInstallmentGroup = e.getInstallmentGroupId() != null
+                && e.getInstallmentCount() != null
+                && e.getInstallmentCount() > 1;
+        boolean wasSplit = e.getSplitGroupId() != null
+                && e.getSplitPartCount() != null
+                && e.getSplitPartCount() > 1;
+        List<ExpenseSplitPart> splits = request.splits();
+        boolean requestIsSplit = splits != null && splits.size() >= 2;
+
+        if (wasInstallmentGroup) {
+            if (requestIsSplit) {
+                throw new BadRequestException("Não é possível transformar parcelas em divisão entre pessoas nesta tela");
+            }
+            e.setCard(card);
+            e.setAmount(request.amount());
+            e.setDescription(request.description().trim());
+            e.setExpenseDate(request.expenseDate());
+            applySpender(e, card, request);
+            e.setNotes(request.notes() == null || request.notes().isBlank() ? null : request.notes().trim());
+            return toResponse(expenseRepository.save(e));
+        }
+
+        if (requestIsSplit) {
+            if (requestedInstallments > 1) {
+                throw new BadRequestException("Não é possível combinar parcelamento e divisão entre pessoas");
+            }
+            validateSplitPartsTotal(request.amount(), splits);
+            if (wasSplit) {
+                expenseRepository.deleteBySplitGroupId(e.getSplitGroupId());
+            } else {
+                expenseRepository.deleteById(id);
+            }
+            List<ExpenseResponse> created = persistSplitPurchase(card, request, splits);
+            return created.get(0);
+        }
+
+        if (wasSplit) {
+            expenseRepository.deleteBySplitGroupId(e.getSplitGroupId());
+            Expense fresh = new Expense();
+            fresh.setCard(card);
+            fresh.setAmount(request.amount());
+            fresh.setDescription(request.description().trim());
+            fresh.setExpenseDate(request.expenseDate());
+            applySpender(fresh, card, request);
+            fresh.setNotes(request.notes() == null || request.notes().isBlank() ? null : request.notes().trim());
+            fresh.setInstallmentCount(1);
+            fresh.setInstallmentIndex(1);
+            fresh.setTotalPurchaseAmount(request.amount());
+            return toResponse(expenseRepository.save(fresh));
+        }
+
         e.setCard(card);
         e.setAmount(request.amount());
         e.setDescription(request.description().trim());
         e.setExpenseDate(request.expenseDate());
         applySpender(e, card, request);
         e.setNotes(request.notes() == null || request.notes().isBlank() ? null : request.notes().trim());
-        return toResponse(e);
+        return toResponse(expenseRepository.save(e));
     }
 
     @Transactional
@@ -145,6 +267,10 @@ public class ExpenseService {
         }
         if (deleteGroup && e.getInstallmentGroupId() != null) {
             expenseRepository.deleteByInstallmentGroupId(e.getInstallmentGroupId());
+            return;
+        }
+        if (deleteGroup && e.getSplitGroupId() != null) {
+            expenseRepository.deleteBySplitGroupId(e.getSplitGroupId());
             return;
         }
         expenseRepository.deleteById(id);
@@ -168,7 +294,10 @@ public class ExpenseService {
                 e.getInstallmentGroupId(),
                 e.getInstallmentIndex(),
                 e.getInstallmentCount(),
-                e.getTotalPurchaseAmount()
+                e.getTotalPurchaseAmount(),
+                e.getSplitGroupId(),
+                e.getSplitPartIndex(),
+                e.getSplitPartCount()
         );
     }
 }

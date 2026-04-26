@@ -18,6 +18,9 @@ public record ExpenseResponse(
         String installmentGroupId,
         Integer installmentIndex,
         Integer installmentCount,
-        BigDecimal totalPurchaseAmount
+        BigDecimal totalPurchaseAmount,
+        String splitGroupId,
+        Integer splitPartIndex,
+        Integer splitPartCount
 ) {
 }
